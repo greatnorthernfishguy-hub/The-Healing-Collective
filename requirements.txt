@@ -1,0 +1,14 @@
+# The Healing Collective — Dependencies
+#
+# Changelog:
+# [2026-02-26] Claude (Opus 4.6) — Initial creation.
+#   Mirrors TrollGuard's dependency pattern for E-T Systems consistency.
+#   Core deps are required; optional deps have comments.
+
+# --- Core: Always Required ---
+numpy                   # NG-Lite + vector operations + DVS embeddings
+pyyaml                  # config.yaml parsing
+msgpack                 # DVS primary persistence format
+
+# --- Embeddings (Tier 1/2) ---
+sentence-transformers   # all-MiniLM-L6-v2 embeddings (384-dim, CPU-optimized)

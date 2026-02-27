@@ -17,9 +17,13 @@ The Healing Collective observes failures across host systems and connected peer 
 │    │  Engine    │  │  (Vector  │  │  Primitives  │  │
 │    │  (7-step)  │  │   Store)  │  │  (8 built-in)│  │
 │    └───────────┘  └───────────┘  └──────────────┘  │
+│    ┌───────────┐  ┌───────────┐  ┌──────────────┐  │
+│    │  Health   │  │ Congre-   │  │  Pattern     │  │
+│    │  Monitor  │  │  gation   │  │  Compression │  │
+│    └───────────┘  └───────────┘  └──────────────┘  │
 ├─────────────────────────────────────────────────────┤
 │          NG-Lite Substrate + NGEcosystem             │
-│    Tier 1: Standalone  →  Tier 2: Peer  →  Tier 3   │
+│  Tier 1: Standalone → Tier 2: Peer → Tier 3: Cluster│
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -110,6 +114,40 @@ The seven-step pipeline processes every failure:
 | `checkpoint_restore` | peer | Restore from known-good checkpoint |
 | `connection_pool_reset` | host | Drain and reinitialize pool |
 
+## Health Monitor
+
+Background substrate health monitoring (runs as a daemon thread):
+
+- **Weight divergence** — detects when synapses have learned extreme associations
+- **Firing rate** — identifies dead nodes wasting substrate capacity
+- **Novelty saturation** — flags when the substrate is losing discriminative power
+
+Detected issues trigger proactive repairs through the diagnosis engine.
+
+## Congregation
+
+Peer deliberation for uncertain repairs. When confidence falls in the recommendation zone (0.40–0.70), the Congregation polls peer modules' shared learning events:
+
+- Reads peer event files for repair records matching the failure embedding
+- Similarity-weighted vote aggregation adjusts confidence up or down
+- Consensus among 2+ peers can elevate a recommendation to auto-execute
+
+## Pattern Compression
+
+Periodic DVS compaction that clusters similar entries by embedding similarity:
+
+- Triggered at 80% DVS fullness or every 7 days
+- Clusters of 3+ similar entries are replaced with synthetic COMPRESSED_PATTERN entries
+- Preserves aggregate knowledge (counts, outcomes, dominant primitive) while reducing storage
+
+## Tier 3 Cluster Learning
+
+Extends learning from dyadic peer pairs to full cluster knowledge sharing:
+
+- Broadcasts successful repair outcomes to `shared_learning/` directory
+- Syncs peer repair records into local DVS at startup and periodically
+- Cluster-aggregated confidence blends local + all-peer success rates
+
 ## Configuration
 
 Override defaults in `~/.et_modules/healing_collective/config.yaml`:
@@ -124,10 +162,21 @@ dvs_max_entries: 10000
 health_monitor:
   enabled: true
   interval_seconds: 120
+  weight_divergence_threshold: 2.0
+  min_firing_rate: 0.001
+  novelty_saturation_threshold: 0.95
 
 congregation:
   confidence_spread: 0.15
   max_candidates: 4
+  timeout_seconds: 10.0
+  require_for_host_repairs: true
+
+compression:
+  trigger_pct: 0.80
+  similarity_threshold: 0.85
+  min_cluster: 3
+  cycle_days: 7
 ```
 
 ## Testing

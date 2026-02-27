@@ -24,6 +24,14 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-02-27] Claude (Opus 4.6) — Phase 3+4 integration.
+#   What: Added Health Monitor, Congregation, Compression, and Tier 3
+#         Coordinator initialization.  Updated _module_stats() with
+#         Phase 3+4 telemetry.  Added compression timer.
+#   Why:  Phases 3+4 complete the Alpha feature set.
+#   How:  New modules initialized after engine to break circular deps.
+#         Health monitor and compression timer run as daemon threads.
+#
 # [2026-02-26] Claude (Opus 4.6) — Initial creation.
 #   What: HealingCollectiveHook — OpenClawAdapter subclass with Diagnosis
 #         Engine, DVS, and repair primitive registry.
@@ -114,19 +122,73 @@ class HealingCollectiveHook(OpenClawAdapter):
             embed_fn=self._embed,
         )
 
+        # --- Phase 3: Health Monitor + Congregation ---
+        from core.health_monitor import HealthMonitor
+        from core.congregation import Congregation
+
+        self._health_monitor = HealthMonitor(
+            config=self._config.health_monitor,
+            ng_ecosystem=self._eco,
+            dvs=self._dvs,
+            engine=self._engine,
+        )
+
+        self._congregation = Congregation(
+            config=self._config.congregation,
+            ng_ecosystem=self._eco,
+            dvs=self._dvs,
+            embed_fn=self._embed,
+        )
+        self._engine._congregation = self._congregation
+
+        # --- Phase 4: Compression + Tier 3 Coordinator ---
+        from core.compression import PatternCompressor
+        from core.tier3_upgrade import Tier3Coordinator
+
+        self._compressor = PatternCompressor(
+            config=self._config.compression,
+            dvs=self._dvs,
+        )
+
+        self._tier3 = Tier3Coordinator(
+            module_id=self.MODULE_ID,
+            ng_ecosystem=self._eco,
+            dvs=self._dvs,
+            embed_fn=self._embed,
+        )
+        self._engine._tier3 = self._tier3
+
+        # Startup: sync cluster knowledge (Tier 3)
+        try:
+            self._tier3.sync_cluster_knowledge()
+        except Exception:
+            pass
+
+        # Start Health Monitor background thread
+        self._health_monitor.start()
+
         # Checkpoint timer
         self._checkpoint_timer: Optional[threading.Timer] = None
         self._schedule_checkpoint()
+
+        # Compression timer (runs once per cycle)
+        self._compression_timer: Optional[threading.Timer] = None
+        self._schedule_compression()
 
         # Signal handlers for graceful shutdown
         self._register_shutdown_handlers()
 
         logger.info(
-            "[%s] Healing Collective ready (tier %d, %d DVS entries, %d primitives)",
+            "[%s] Healing Collective ready (tier %d, %d DVS entries, %d primitives, "
+            "health_monitor=%s, congregation=%s, compression=%s, tier3=%s)",
             self.MODULE_ID,
             self._eco.tier if self._eco else 0,
             self._dvs.size,
             len(self._primitives),
+            "on" if self._config.health_monitor.enabled else "off",
+            "on",
+            "on",
+            "on",
         )
 
     # -----------------------------------------------------------------
@@ -191,7 +253,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         engine_stats = self._engine.stats()
         dvs_stats = self._dvs.stats()
 
-        return {
+        stats = {
             "failures_observed": engine_stats["failures_observed"],
             "repairs_executed": engine_stats["repairs_executed"],
             "repairs_succeeded": engine_stats["repairs_succeeded"],
@@ -201,7 +263,12 @@ class HealingCollectiveHook(OpenClawAdapter):
             "substrate_augmented": dvs_stats["substrate_augmented"],
             "primitives_registered": engine_stats["primitives_registered"],
             "active_cooldowns": engine_stats["active_cooldowns"],
+            "health_monitor": self._health_monitor.stats(),
+            "congregation": self._congregation.stats(),
+            "compression": self._compressor.stats(),
+            "tier3": self._tier3.stats(),
         }
+        return stats
 
     # -----------------------------------------------------------------
     # Public API: Channel 2 Host API
@@ -262,6 +329,27 @@ class HealingCollectiveHook(OpenClawAdapter):
         self._engine.register_primitive(name, instance)
 
     # -----------------------------------------------------------------
+    # Compression timer (Phase 4)
+    # -----------------------------------------------------------------
+
+    def _schedule_compression(self) -> None:
+        """Schedule periodic compression check."""
+        # Check every hour whether compression should run
+        self._compression_timer = threading.Timer(3600, self._do_compression)
+        self._compression_timer.daemon = True
+        self._compression_timer.start()
+
+    def _do_compression(self) -> None:
+        """Check and run compression if needed."""
+        try:
+            if self._compressor.should_compress():
+                self._compressor.compress()
+        except Exception as exc:
+            logger.warning("Compression cycle failed: %s", exc)
+        finally:
+            self._schedule_compression()
+
+    # -----------------------------------------------------------------
     # Checkpointing (PRD §6.2)
     # -----------------------------------------------------------------
 
@@ -298,6 +386,9 @@ class HealingCollectiveHook(OpenClawAdapter):
         def _shutdown_handler(signum, frame):
             logger.info("Shutdown signal received, saving state...")
             try:
+                self._health_monitor.stop()
+                if self._compression_timer:
+                    self._compression_timer.cancel()
                 self._dvs.save()
                 if self._eco:
                     self._eco.save()

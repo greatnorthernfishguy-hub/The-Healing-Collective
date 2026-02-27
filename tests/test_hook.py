@@ -40,6 +40,7 @@ class MockEcosystem:
         self.tier = 1
         self.tier_name = "Standalone (Tier 1)"
         self._ng = MockNGLite()
+        self._peer_bridge = None
 
     def record_outcome(self, embedding, target_id, success, metadata=None):
         return None

@@ -2,6 +2,46 @@
 
 All notable changes to The Healing Collective will be documented in this file.
 
+## [0.4.0] - 2026-02-27
+
+### Added
+- **Pattern Compression** (`core/compression.py`): DVS compaction engine with
+  greedy agglomerative clustering, pattern synthesis, and threshold/periodic
+  triggering.  Similar entries are replaced with COMPRESSED_PATTERN entries
+  that preserve aggregate knowledge.
+- **Tier 3 Coordinator** (`core/tier3_upgrade.py`): Cluster-wide repair
+  knowledge sharing.  Broadcasts successful repairs to shared learning
+  directory; syncs peer repair records into local DVS at startup and
+  periodically; provides cluster-aggregated confidence scoring.
+
+### Changed
+- **Diagnosis Engine**: Tier 3 broadcast fires after successful repair
+  execution, sharing outcomes with the entire cluster.
+- **Hook**: Compression timer (hourly check), Tier 3 startup sync,
+  updated shutdown handler to stop all background threads.
+- Version bump: 0.3.0 → 0.4.0 (Alpha).
+
+## [0.3.0] - 2026-02-27
+
+### Added
+- **Health Monitor** (`core/health_monitor.py`): Background substrate health
+  monitoring with three checks — weight divergence, firing rate (dead nodes),
+  and novelty saturation.  Triggers proactive repairs through the diagnosis
+  engine when issues are detected.
+- **Congregation** (`core/congregation.py`): Peer deliberation for uncertain
+  repairs.  When confidence falls in the recommendation zone, polls peer
+  modules' shared learning events for consensus.  Similarity-weighted vote
+  aggregation adjusts confidence up or down.
+
+### Changed
+- **Diagnosis Engine**: Congregation consulted between Propose and Validate
+  when action is "recommend"; consensus can elevate to auto-execute.
+  Added `_congregation` and `_tier3` optional collaborators.
+- **Hook**: Health Monitor and Congregation initialized after engine,
+  wired via post-init setters to break circular dependencies.
+  `_module_stats()` now includes Phase 3+4 telemetry.
+- Test suite expanded: 78 → 120 tests.
+
 ## [0.2.0] - 2026-02-26
 
 ### Added

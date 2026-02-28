@@ -167,7 +167,7 @@ except (FileNotFoundError, json.JSONDecodeError):
 registry['modules']['healing_collective'] = {
     'module_id': 'healing_collective',
     'display_name': 'The Healing Collective',
-    'version': '0.1.0',
+    'version': '0.4.0',
     'description': 'Adaptive self-healing intelligence for the E-T Systems ecosystem',
     'install_path': '$INSTALL_DIR',
     'git_remote': 'https://github.com/greatnorthernfishguy-hub/The-Healing-Collective-.git',
@@ -239,7 +239,7 @@ uninstall() {
 # --- Main ---
 main() {
     echo "============================================"
-    echo "  The Healing Collective Installer v0.1.0"
+    echo "  The Healing Collective Installer v0.4.0"
     echo "  Adaptive Self-Healing Intelligence"
     echo "============================================"
     echo ""

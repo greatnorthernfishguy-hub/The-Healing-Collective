@@ -18,6 +18,15 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-02-27] Claude (Opus 4.6) — Phase 3+4 integration.
+#   What: Added Congregation deliberation in recommend zone and Tier 3
+#         repair broadcast after successful execution.
+#   Why:  Congregation elevates uncertain repairs via peer consensus.
+#         Tier 3 broadcasts share repair outcomes across the cluster.
+#   How:  Optional _congregation and _tier3 collaborators set post-init.
+#         Congregation consulted between Propose and Validate when action
+#         is "recommend".  Tier 3 broadcast fires after successful Execute.
+#
 # [2026-02-26] Claude (Opus 4.6) — Initial creation.
 #   What: DiagnosisEngine implementing the 7-step pipeline from PRD §2.2.5.
 #   Why:  The engine connects failure observation to repair action using
@@ -102,6 +111,10 @@ class DiagnosisEngine:
         self._eco = ng_ecosystem
         self._primitives = dict(primitives)
         self._embed_fn = embed_fn
+
+        # Optional Phase 3+4 collaborators (set post-init to break circular deps)
+        self._congregation: Any = None
+        self._tier3: Any = None
 
         # Cooldown tracking: (failure_hash, primitive_name) -> expiry timestamp
         self._cooldowns: Dict[Tuple[str, str], float] = {}
@@ -213,6 +226,31 @@ class DiagnosisEngine:
                 if time.time() < self._cooldowns[cooldown_key]:
                     action = "recommend"  # Downgrade to recommendation
 
+        # --- Phase 3: Congregation deliberation ---
+        # When in the recommend zone, consult peers for consensus
+        if (
+            action == "recommend"
+            and proposed_primitive
+            and self._congregation is not None
+            and self._congregation.should_deliberate(
+                confidence, source, effective_threshold,
+                self._config.confidence_recommend,
+            )
+        ):
+            try:
+                cong_result = self._congregation.deliberate(
+                    failure_embedding=embedding,
+                    proposed_primitive=proposed_primitive,
+                    local_confidence=confidence,
+                    failure_description=description,
+                )
+                confidence = cong_result.adjusted_confidence
+                # Re-evaluate action with adjusted confidence
+                if confidence >= effective_threshold:
+                    action = "auto_execute"
+            except Exception as exc:
+                logger.debug("Congregation deliberation failed: %s", exc)
+
         result = DiagnosisResult(
             tracking_id=tracking_id,
             failure_description=description,
@@ -292,6 +330,20 @@ class DiagnosisEngine:
                 self._cooldowns[cooldown_key] = (
                     time.time() + self._config.repair_cooldown_seconds
                 )
+
+                # Phase 4: Tier 3 broadcast — share repair outcome with cluster
+                if self._tier3 is not None:
+                    try:
+                        self._tier3.broadcast_repair(
+                            failure_description=description,
+                            embedding=embedding,
+                            proposed_primitive=proposed_primitive,
+                            confidence=confidence,
+                            outcome=execution.status,
+                            tracking_id=tracking_id,
+                        )
+                    except Exception:
+                        pass
 
                 logger.info(
                     "[%s] Executed %s: %s (%s)",

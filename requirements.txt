@@ -11,4 +11,4 @@ pyyaml                  # config.yaml parsing
 msgpack                 # DVS primary persistence format
 
 # --- Embeddings (Tier 1/2) ---
-sentence-transformers   # all-MiniLM-L6-v2 embeddings (384-dim, CPU-optimized)
+fastembed>=0.2.0        # all-MiniLM-L6-v2 via ONNX Runtime (no torch dependency)

@@ -28,7 +28,7 @@
 set -euo pipefail
 
 # --- Configuration (overridable via environment) ---
-INSTALL_DIR="${HC_INSTALL_DIR:-$HOME/The-Healing-Collective-}"
+INSTALL_DIR="${HC_INSTALL_DIR:-$HOME/The-Healing-Collective}"
 SERVICE_NAME="healing_collective"
 ET_MODULES_DIR="${ET_MODULES_DIR:-$HOME/.et_modules}"
 SHARED_LEARNING_DIR="$ET_MODULES_DIR/shared_learning"
@@ -98,9 +98,9 @@ install_deps() {
     # Core dependencies
     $PYTHON -m pip install numpy pyyaml msgpack 2>/dev/null
 
-    # Sentence transformers (largest dependency)
-    info "Installing sentence-transformers (this may take a minute)..."
-    $PYTHON -m pip install sentence-transformers 2>/dev/null
+    # fastembed (ONNX Runtime — ecosystem standard, no torch)
+    info "Installing fastembed..."
+    $PYTHON -m pip install fastembed 2>/dev/null
 
     info "Dependencies installed."
 }
@@ -155,36 +155,18 @@ setup_shared_learning() {
     info "Registering with ET Module Manager..."
 
     $PYTHON -c "
-import json, os, time
-registry_path = '$ET_MODULES_DIR/registry.json'
+import sys
+sys.path.insert(0, '$INSTALL_DIR')
+from et_modules.manager import ETModuleManager, ModuleManifest
 
-try:
-    with open(registry_path, 'r') as f:
-        registry = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    registry = {'modules': {}}
-
-registry['modules']['healing_collective'] = {
-    'module_id': 'healing_collective',
-    'display_name': 'The Healing Collective',
-    'version': '0.4.0',
-    'description': 'Adaptive self-healing intelligence for the E-T Systems ecosystem',
-    'install_path': '$INSTALL_DIR',
-    'git_remote': 'https://github.com/greatnorthernfishguy-hub/The-Healing-Collective-.git',
-    'git_branch': 'main',
-    'entry_point': 'healing_collective_hook.py',
-    'ng_lite_version': '1.0.0',
-    'dependencies': [],
-    'service_name': 'healing_collective',
-    'api_port': 0,
-    'registered_at': time.time(),
-}
-registry['last_updated'] = time.time()
-
-with open(registry_path, 'w') as f:
-    json.dump(registry, f, indent=2)
-
-print('Registered The Healing Collective in ET Module Manager')
+manifest = ModuleManifest.from_file('$INSTALL_DIR/et_module.json')
+if manifest:
+    manifest.install_path = '$INSTALL_DIR'
+    manager = ETModuleManager()
+    manager.register(manifest)
+    print(f'  Registered: {manifest.module_id} v{manifest.version}')
+else:
+    print('  WARNING: Could not load et_module.json')
 " 2>/dev/null || warn "ET Module Manager registration failed (non-critical)"
 }
 

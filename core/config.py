@@ -84,6 +84,13 @@ class HealingCollectiveConfig:
     dvs_persistence_format: str = "msgpack"
     dvs_search_top_k: int = 10
 
+    # Failure detection (substrate-based, replaces static regex patterns)
+    # A message is routed to the diagnosis engine when DVS similarity to
+    # known failure signatures exceeds this threshold, OR when substrate
+    # novelty exceeds novelty_routing_threshold (unknown-but-suspicious).
+    failure_similarity_threshold: float = 0.40
+    novelty_routing_threshold: float = 0.85
+
     # Checkpointing (PRD §6.2)
     checkpoint_interval_seconds: int = 300
 

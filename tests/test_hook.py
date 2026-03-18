@@ -5,6 +5,16 @@ Tests the hook WITHOUT requiring the full OpenClawAdapter ecosystem
 by mocking ng_ecosystem.init().
 
 # ---- Changelog ----
+# [2026-03-18] Claude (CC) — Updated TestMessageScanning for substrate detection
+# What: Rewrote failure detection tests to match new substrate-based
+#   detection (punch list #70). Old tests used regex pattern matching;
+#   new tests verify DVS similarity trigger, novelty trigger, and
+#   result metadata fields.
+# Why: _FAILURE_PATTERNS regex gate replaced with substrate signals.
+# How: Pre-seed DVS with failure signature for similarity test. Mock
+#   ecosystem novelty for novelty trigger test. Verify new result
+#   fields (dvs_similarity, novelty, trigger).
+# -------------------
 # [2026-02-26] Claude (Opus 4.6) — Initial creation.
 # -------------------
 """
@@ -206,17 +216,65 @@ class TestRegisterPrimitive:
 
 
 class TestMessageScanning:
-    def test_failure_detection_in_message(self, hook_instance):
+    def test_dvs_similarity_triggers_detection(self, hook_instance):
+        """When DVS contains a similar failure signature, detection fires."""
+        # Pre-seed DVS with a failure signature via report_failure
+        hook_instance.report_failure("Connection refused on port 5432")
+
+        # Now send a similar message — DVS should find the seeded signature
+        failure_embedding = _hash_embed("Connection refused on port 5432")
         result = hook_instance._module_on_message(
-            "Error: connection refused on port 5432",
-            _hash_embed("Error: connection refused on port 5432"),
+            "Connection refused on port 5432",
+            failure_embedding,
+        )
+        # Same embedding should have high DVS similarity to the seeded entry
+        assert result["dvs_similarity"] > 0
+        assert "trigger" in result
+        assert "novelty" in result
+
+    def test_novelty_triggers_detection(self, hook_instance):
+        """When substrate reports high novelty, detection fires."""
+        # Mock ecosystem to return very high novelty
+        hook_instance._eco.detect_novelty = lambda emb: 0.95
+
+        result = hook_instance._module_on_message(
+            "Something completely unprecedented happened",
+            _hash_embed("Something completely unprecedented happened"),
         )
         assert result["failure_detected"] is True
+        assert result["trigger"] == "novelty"
+        assert result["novelty"] >= 0.85
         assert "diagnosis" in result
 
     def test_clean_message_no_detection(self, hook_instance):
+        """Normal messages with no DVS match and low novelty pass through."""
+        # Default mock ecosystem returns novelty=0.5, below threshold
         result = hook_instance._module_on_message(
             "The weather is nice today",
             _hash_embed("The weather is nice today"),
         )
         assert result["failure_detected"] is False
+        assert result["trigger"] == "none"
+
+    def test_result_metadata_fields(self, hook_instance):
+        """Substrate detection results include observability metadata."""
+        result = hook_instance._module_on_message(
+            "Routine status check",
+            _hash_embed("Routine status check"),
+        )
+        assert "dvs_similarity" in result
+        assert "novelty" in result
+        assert "trigger" in result
+        assert isinstance(result["dvs_similarity"], float)
+        assert isinstance(result["novelty"], float)
+
+    def test_no_regex_dependency(self):
+        """Verify the hook module does not import re (Law 7 compliance)."""
+        import healing_collective_hook as hch
+        import ast
+        with open(hch.__file__) as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name != "re", "re module should not be imported"

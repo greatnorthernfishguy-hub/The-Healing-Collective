@@ -24,6 +24,22 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-03-18] Claude (CC) — Replace regex failure gate with substrate detection
+# What: Removed _FAILURE_PATTERNS regex list and keyword-matching gate.
+#   Messages are now routed to the diagnosis engine based on substrate
+#   signals: DVS similarity to known failure signatures and/or high
+#   substrate novelty (unknown-but-suspicious patterns). Detection
+#   thresholds are managed by DetectionCalibrator with three-tier
+#   competence model (Apprentice → Journeyman → Master).
+# Why: Punch list #70 — Law 7 violation. The regex patterns pre-classified
+#   messages before the substrate could see them. The substrate should
+#   make this call, with increasing autonomy as it demonstrates competence.
+# How: _module_on_message() probes DVS for similarity and checks substrate
+#   novelty. DetectionCalibrator provides thresholds — static in Apprentice
+#   mode, bounded-adaptive in Journeyman, unbounded in Master. Graduation
+#   is competence-based: outcome count + accuracy, not time. Calibrator
+#   state persists to detection_calibrator.json.
+# -------------------
 # [2026-02-27] Claude (Opus 4.6) — Phase 3+4 integration.
 #   What: Added Health Monitor, Congregation, Compression, and Tier 3
 #         Coordinator initialization.  Updated _module_stats() with
@@ -46,9 +62,14 @@ SKILL.md entry:
 
 from __future__ import annotations
 
+# Auto-update on startup — pull latest code + sync vendored files
+try:
+    from ng_updater import auto_update; auto_update()
+except Exception:
+    pass  # Never prevent module startup
+
 import logging
 import os
-import re
 import signal
 import tempfile
 import threading
@@ -61,15 +82,6 @@ import numpy as np
 from openclaw_adapter import OpenClawAdapter
 
 logger = logging.getLogger("healing_collective_hook")
-
-# Failure indicator patterns for message scanning
-_FAILURE_PATTERNS = [
-    re.compile(r"\b(error|exception|traceback|failed|failure|crash|fatal)\b", re.IGNORECASE),
-    re.compile(r"\b(timeout|timed\s*out|connection\s*refused|unreachable)\b", re.IGNORECASE),
-    re.compile(r"\b(oom|out\s*of\s*memory|memory\s*error|segfault)\b", re.IGNORECASE),
-    re.compile(r"\b(permission\s*denied|access\s*denied|unauthorized)\b", re.IGNORECASE),
-    re.compile(r"\b(corrupt|corrupted|inconsistent|integrity)\b", re.IGNORECASE),
-]
 
 
 class HealingCollectiveHook(OpenClawAdapter):
@@ -89,9 +101,13 @@ class HealingCollectiveHook(OpenClawAdapter):
 
         # Import core modules (after OpenClawAdapter init sets up ecosystem)
         from core.config import HealingCollectiveConfig
+        from core.detection_calibrator import DetectionCalibrator
         from core.diagnosis_engine import DiagnosisEngine
-        from core.dvs import DiagnosticVectorStore
+        from core.dvs import DiagnosticVectorStore, DVSEntryType
         from core.repair_primitives import DEFAULT_PRIMITIVES, RepairPrimitive
+
+        # Cache the entry type enum for substrate-based failure detection
+        self._dvs_failure_type = DVSEntryType.FAILURE_SIGNATURE
 
         # Load configuration
         self._config = HealingCollectiveConfig.from_yaml()
@@ -100,6 +116,12 @@ class HealingCollectiveHook(OpenClawAdapter):
         self._module_dir = Path.home() / ".et_modules" / "healing_collective"
         self._module_dir.mkdir(parents=True, exist_ok=True)
         (self._module_dir / "checkpoints").mkdir(exist_ok=True)
+
+        # Detection calibrator — three-tier competence model for
+        # failure detection thresholds (Apprentice → Journeyman → Master)
+        self._calibrator = DetectionCalibrator(
+            persistence_path=str(self._module_dir / "detection_calibrator.json"),
+        )
 
         # Initialize DVS with NG-Lite substrate from ecosystem
         dvs_path = str(self._module_dir / "dvs.msgpack")
@@ -196,43 +218,86 @@ class HealingCollectiveHook(OpenClawAdapter):
     # -----------------------------------------------------------------
 
     def _embed(self, text: str) -> np.ndarray:
-        """Embed text using sentence-transformers, fall back to hash."""
-        try:
-            from sentence_transformers import SentenceTransformer
+        """Embed text using fastembed (ONNX Runtime), fall back to hash.
 
-            if not hasattr(self, "_st_model"):
-                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
-            vec = self._st_model.encode(text, normalize_embeddings=True)
-            return np.array(vec, dtype=np.float32)
+        Ecosystem standard: fastembed/all-MiniLM-L6-v2 (384-dim).
+        No torch dependency.
+        """
+        try:
+            if not hasattr(self, "_fe_model"):
+                from fastembed import TextEmbedding
+                self._fe_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+            vecs = list(self._fe_model.embed([text]))
+            return np.array(vecs[0], dtype=np.float32)
         except Exception:
             return self._hash_embed(text)
 
     def _module_on_message(self, text: str, embedding: np.ndarray) -> Dict[str, Any]:
-        """Scan message for failure indicators and route to engine.
+        """Detect failures via substrate signals and route to engine.
 
-        The Collective monitors the OpenClaw message stream for failure
-        indicators.  Messages containing failure signals are routed to
-        the Diagnosis Engine.  All messages contribute to the baseline.
+        The Collective lets the substrate decide what looks like a failure.
+        Two substrate signals trigger routing to the Diagnosis Engine:
+
+        1. DVS similarity — the message embedding is similar to known
+           failure signatures already in the Diagnostic VectorStore.
+        2. High novelty — the substrate has never seen anything like this,
+           which may indicate a new failure type worth investigating.
+
+        Both thresholds are configurable. The substrate learns what
+        failures look like from diagnosis outcomes, not from keyword lists.
         """
         result: Dict[str, Any] = {}
 
-        # Scan for failure indicators
-        failure_detected = False
-        matched_patterns = []
-        for pattern in _FAILURE_PATTERNS:
-            match = pattern.search(text)
-            if match:
-                failure_detected = True
-                matched_patterns.append(match.group())
+        # Probe DVS for similarity to known failure signatures
+        dvs_similarity = 0.0
+        try:
+            dvs_hits = self._dvs.search(
+                embedding, top_k=1,
+                entry_type=self._dvs_failure_type,
+            )
+            if dvs_hits:
+                dvs_similarity = dvs_hits[0][1]
+        except Exception:
+            pass
+
+        # Check substrate novelty
+        novelty = 0.0
+        try:
+            if self._eco:
+                novelty = self._eco.detect_novelty(embedding)
+        except Exception:
+            pass
+
+        # Get adaptive thresholds from calibrator (tier-appropriate)
+        sim_threshold, nov_threshold = self._calibrator.get_thresholds()
+
+        # Route to engine if either signal exceeds threshold
+        similarity_triggered = dvs_similarity >= sim_threshold
+        novelty_triggered = novelty >= nov_threshold
+        failure_detected = similarity_triggered or novelty_triggered
 
         result["failure_detected"] = failure_detected
+        result["dvs_similarity"] = round(dvs_similarity, 4)
+        result["novelty"] = round(novelty, 4)
+        result["detection_tier"] = self._calibrator.tier.value
+        result["trigger"] = (
+            "dvs_similarity" if similarity_triggered
+            else "novelty" if novelty_triggered
+            else "none"
+        )
 
         if failure_detected:
-            # Route to Diagnosis Engine
+            trigger = result["trigger"]
             try:
                 diagnosis = self._engine.diagnose(
                     description=text,
-                    metadata={"matched_patterns": matched_patterns, "source": "openclaw_message"},
+                    metadata={
+                        "source": "openclaw_message",
+                        "dvs_similarity": dvs_similarity,
+                        "novelty": novelty,
+                        "trigger": trigger,
+                        "detection_tier": self._calibrator.tier.value,
+                    },
                     source="host",
                 )
                 result["diagnosis"] = {
@@ -242,6 +307,22 @@ class HealingCollectiveHook(OpenClawAdapter):
                     "confidence": diagnosis.confidence,
                     "action_taken": diagnosis.action_taken,
                 }
+
+                # Feed outcome to calibrator — was this a real failure?
+                # A real failure is one where the engine proposed a repair
+                # with non-trivial confidence (not just "log_and_recommend"
+                # at minimum confidence).
+                was_real = (
+                    diagnosis.proposed_primitive is not None
+                    and diagnosis.confidence >= self._config.confidence_recommend
+                )
+                self._calibrator.record_outcome(
+                    similarity_score=dvs_similarity,
+                    novelty_score=novelty,
+                    trigger=trigger,
+                    was_real_failure=was_real,
+                )
+
             except Exception as exc:
                 logger.warning("Diagnosis failed for message: %s", exc)
                 result["diagnosis_error"] = str(exc)
@@ -263,6 +344,7 @@ class HealingCollectiveHook(OpenClawAdapter):
             "substrate_augmented": dvs_stats["substrate_augmented"],
             "primitives_registered": engine_stats["primitives_registered"],
             "active_cooldowns": engine_stats["active_cooldowns"],
+            "detection_calibrator": self._calibrator.stats(),
             "health_monitor": self._health_monitor.stats(),
             "congregation": self._congregation.stats(),
             "compression": self._compressor.stats(),

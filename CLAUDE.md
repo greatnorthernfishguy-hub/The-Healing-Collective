@@ -6,6 +6,17 @@
 **This document adds THC-specific rules on top of those Laws.**
 
 ---
+## Vault Context
+For full ecosystem context, read these from the Obsidian vault (`~/docs/`):
+- **Module page:** `~/docs/modules/THC.md`
+- **Concepts:** `~/docs/concepts/The Triad.md`, `~/docs/concepts/Competence Model.md`, `~/docs/concepts/Vendored Files.md`
+- **Systems:** `~/docs/systems/NG-Lite.md`, `~/docs/systems/NG Peer Bridge.md`, `~/docs/systems/Dual-Pass Embedding.md`
+- **Audits:** `~/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`, `~/docs/audits/ecosystem-static-value-audit-2026-03-23.md`
+
+Each vault page has a Context Map at the top linking to related docs. Follow those links for ripple effects and dependencies.
+
+---
+
 
 ## What This Repo Is
 

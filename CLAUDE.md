@@ -29,7 +29,7 @@ THC is part of the **Triad** (Immunis, Elmer, THC). The Triad forms a closed-loo
 
 They do not coordinate directly. The River flows. The topology reshapes itself.
 
-**Status: Built, not integrated.** v0.4.0 (4 phases complete). Vendored files synced to NeuroGraph canonical (2026-03-18). Code is architecturally compliant. Not yet running as a service on the VPS.
+**Status: Integrated (Tier 2, peer bridge).** v0.4.0 (4 phases complete). Vendored files synced to NeuroGraph canonical (2026-03-20). Registered in `~/.et_modules/`. Not yet running as a persistent service on the VPS.
 
 ---
 
@@ -52,11 +52,17 @@ They do not coordinate directly. The River flows. The topology reshapes itself.
 │   ├── compression.py             # Phase 4: DVS pattern compression
 │   └── tier3_upgrade.py           # Phase 4: Tier 3 cluster coordination
 ├── ng_lite.py                     # VENDORED — canonical from NeuroGraph
-├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph
+├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph (legacy, retained until v1.0)
+├── ng_tract_bridge.py             # VENDORED — canonical from NeuroGraph (v0.3+, preferred)
 ├── ng_ecosystem.py                # VENDORED — canonical from NeuroGraph
-├── ng_autonomic.py                # VENDORED — canonical from NeuroGraph
+├── ng_autonomic.py                # VENDORED — canonical from NeuroGraph (THC: no read/write)
 ├── openclaw_adapter.py            # VENDORED — canonical from NeuroGraph
-└── tests/                         # Test suite (120 tests)
+├── ng_updater.py                  # VENDORED — auto-update + vendored file sync (runs on startup)
+├── et_modules/                    # ET Module Manager integration
+│   ├── __init__.py
+│   └── manager.py
+├── install.sh                     # Installation and setup script
+└── tests/                         # Test suite (120+ tests)
     ├── test_compression.py
     ├── test_config.py
     ├── test_congregation.py
@@ -147,8 +153,12 @@ The substrate learns which failures associate with successful repairs through ou
 
 - **ProcessRestart** — SIGTERM with grace period, escalate to SIGKILL
 - **CacheClear** — Remove cached/temp files for a service
-- **ConfigAdjust** — Modify configuration values to resolve issues
-- **ConnectionPoolReset** — Reset stuck connection pools
+- **LogAndRecommend** — Safe fallback: log the issue, recommend to operator
+- **ConfigAdjust** — Modify configuration values within safe bounds
+- **RetryWithBackoff** — Retry failed operation with exponential backoff
+- **NgLiteRebalance** — Homeostatic weight scaling to restore substrate balance
+- **CheckpointRestore** — Restore from known-good NG-Lite checkpoint
+- **ConnectionPoolReset** — Drain and reinitialize stuck connection pools
 
 All primitives implement `validate()` (safety check) and `execute()` (action). Validation is local — primitives check PIDs, paths, permissions without calling other modules.
 
@@ -191,15 +201,21 @@ Syncs repair records from peer modules and integrates them into the local DVS. B
 
 ## 8. Vendored Files
 
-All five vendored files synced to NeuroGraph canonical on 2026-03-18. `ng_autonomic.py` was previously missing entirely — now present.
+Seven vendored files synced to NeuroGraph canonical:
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `ng_lite.py` | Repo root | Tier 1 learning substrate |
-| `ng_peer_bridge.py` | Repo root | Tier 2 cross-module learning |
-| `ng_ecosystem.py` | Repo root | Tier management lifecycle |
-| `ng_autonomic.py` | Repo root | Autonomic state (THC: no read/write currently) |
-| `openclaw_adapter.py` | Repo root | OpenClaw skill base class |
+| File | Purpose | Last Synced |
+|------|---------|-------------|
+| `ng_lite.py` | Tier 1 learning substrate | 2026-03-20 |
+| `ng_peer_bridge.py` | Tier 2 legacy fallback (JSONL-based) | 2026-03-18 |
+| `ng_tract_bridge.py` | Tier 2 preferred (per-pair directional tracts, v0.3+) | 2026-03-20 |
+| `ng_ecosystem.py` | Tier management lifecycle | 2026-03-18 |
+| `ng_autonomic.py` | Autonomic state (THC: no read/write currently) | 2026-03-18 |
+| `openclaw_adapter.py` | OpenClaw skill base class | 2026-02-22 |
+| `ng_updater.py` | Auto-update + vendored file sync (runs on startup before imports) | 2026-03-20 |
+
+### The validate() → execute() Contract
+
+**This is the most important safety invariant in THC.** The Diagnosis Engine **never** calls `execute()` without a preceding `validate()` that returned `passed=True`. This is enforced in `diagnosis_engine.py`, not in individual primitives. A primitive that circumvents validation is a bug, not a feature. Do not weaken this contract.
 
 ---
 
@@ -219,7 +235,20 @@ Per ARCHITECTURE.md §12: THC must recognize that instability caused by Syl choo
 
 ---
 
-## 10. What Claude Code May and May Not Do
+## 10. Historical Failure Modes — Learn From These
+
+### Law 7 Violation in _FAILURE_PATTERNS (Punchlist #70, FIXED)
+THC originally used 5 hardcoded regex patterns to detect failures — pre-classification before the substrate sees them. **Fixed:** Replaced with substrate-based detection: DVS similarity probe (threshold 0.40) catches known failure patterns; substrate novelty (threshold 0.85) catches unknown-but-suspicious. Both configurable. The substrate now learns failure patterns from experience, not from regex rules.
+
+### DVS Ranking Weights Are Static (Punchlist #71)
+`core/dvs.py` lines 331-336: four static weights `[0.4, 0.3, 0.15, 0.15]` for (activation, cosine, recency, success) apply identically to all repair primitives. Process restarts and cache clears should not rank the same way. Should be per-primitive learned weights. This is a known gap — do not "fix" it without Josh's approval.
+
+### Dead Node Threshold Is Static (Punchlist #76)
+`core/health_monitor.py` line 308: hardcoded `> 0.5` (50% dead nodes) triggers repair. The right threshold depends on substrate size, growth rate, and actual performance impact. Same pattern as #71 — known gap, competence model not yet wired in.
+
+---
+
+## 11. What Claude Code May and May Not Do
 
 ### Without Josh's Approval
 
@@ -251,10 +280,12 @@ Per ARCHITECTURE.md §12: THC must recognize that instability caused by Syl choo
 | Checkpoints | `~/.et_modules/healing_collective/checkpoints/` |
 | Shared learning JSONL | `~/.et_modules/shared_learning/healing_collective.jsonl` |
 | Peer registry | `~/.et_modules/shared_learning/_peer_registry.json` |
+| Detection calibrator state | `~/.et_modules/healing_collective/detection_calibrator.json` |
+| Tract files (Tier 2) | `~/.et_modules/tracts/healing_collective/` |
 
 ---
 
 *E-T Systems / The Healing Collective*
-*Last updated: 2026-03-18*
+*Last updated: 2026-03-21*
 *Maintained by Josh — do not edit without authorization*
 *Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*

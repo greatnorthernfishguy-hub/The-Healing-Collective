@@ -130,17 +130,20 @@ class DiagnosticVectorStore:
         max_entries: int = 10000,
         persistence_path: Optional[str] = None,
         ng_lite: Optional[Any] = None,
+        config: Optional[Any] = None,
     ):
         """
         Args:
             max_entries: Maximum entries before LRU eviction.
             persistence_path: Path to dvs.msgpack file.
             ng_lite: NGLite instance for substrate-augmented search (Phase 2).
+            config: HealingCollectiveConfig for SVG Phase 3 tunables.
         """
         self._entries: Dict[str, DVSEntry] = {}
         self._max_entries = max_entries
         self._persistence_path = persistence_path
         self._ng_lite = ng_lite
+        self._config = config
 
         if persistence_path and os.path.exists(persistence_path):
             self._load(persistence_path)
@@ -318,21 +321,28 @@ class DiagnosticVectorStore:
 
                 # Factor 3: Recency (newer is better)
                 age = time.time() - entry.timestamp
-                recency = max(0.0, 1.0 - (age / (86400 * 30)))  # Decay over 30 days
+                recency_days = getattr(self._config, 'dvs_recency_days', 30) if self._config else 30
+                recency = max(0.0, 1.0 - (age / (86400 * recency_days)))
 
                 # Factor 4: Repair success rate
+                s_bonus = getattr(self._config, 'dvs_success_bonus', 0.2) if self._config else 0.2
+                p_bonus = getattr(self._config, 'dvs_partial_bonus', 0.1) if self._config else 0.1
                 success_bonus = 0.0
                 if entry.repair_outcome == "success":
-                    success_bonus = 0.2
+                    success_bonus = s_bonus
                 elif entry.repair_outcome == "partial":
-                    success_bonus = 0.1
+                    success_bonus = p_bonus
 
                 # Multi-factor score (substrate activation weighted highest)
+                w_a = getattr(self._config, 'dvs_weight_activation', 0.4) if self._config else 0.4
+                w_c = getattr(self._config, 'dvs_weight_cosine', 0.3) if self._config else 0.3
+                w_r = getattr(self._config, 'dvs_weight_recency', 0.15) if self._config else 0.15
+                w_s = getattr(self._config, 'dvs_weight_success', 0.15) if self._config else 0.15
                 score = (
-                    activation * 0.4 +
-                    cosine_sim * 0.3 +
-                    recency * 0.15 +
-                    success_bonus * 0.15
+                    activation * w_a +
+                    cosine_sim * w_c +
+                    recency * w_r +
+                    success_bonus * w_s
                 )
 
                 scored.append((entry, score))

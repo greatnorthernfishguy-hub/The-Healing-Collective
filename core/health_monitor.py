@@ -305,7 +305,7 @@ class HealthMonitor:
 
             dead_pct = dead_count / len(nodes)
             # Flag if more than 50% of nodes are effectively dead
-            if dead_pct > 0.5:
+            if dead_pct > self._config.dead_node_threshold:
                 return HealthIssue(
                     category="low_firing_rate",
                     severity=min(1.0, dead_pct),
@@ -341,7 +341,7 @@ class HealthMonitor:
             # Sample a few random embeddings and check novelty
             rng = np.random.RandomState(int(time.time()) % (2**31))
             dim = self._eco._ng.config.get("embedding_dim", 384)
-            sample_count = 5
+            sample_count = self._config.novelty_probe_count
             low_novelty_count = 0
 
             for _ in range(sample_count):

@@ -167,7 +167,7 @@ class Congregation:
         adjusted = self._aggregate_votes(votes, local_confidence)
 
         consensus = len(votes) >= 2 and all(
-            v.confidence > 0.5 for v in votes
+            v.confidence > self._config.consensus_threshold for v in votes
         )
         if consensus:
             self._consensus_count += 1
@@ -288,15 +288,15 @@ class Congregation:
                         if event.get("success", False):
                             matching_successes += 1
 
-            if best_similarity < 0.3:
+            if best_similarity < self._config.similarity_floor:
                 return None  # No relevant experience
 
             # Compute peer's confidence based on their experience
             if matching_total > 0:
                 peer_confidence = matching_successes / matching_total
-            elif best_similarity > 0.7:
+            elif best_similarity > self._config.similarity_ceiling:
                 # Peer has seen similar patterns but no matching primitive
-                peer_confidence = 0.3  # Mild support
+                peer_confidence = self._config.default_peer_confidence
             else:
                 peer_confidence = 0.0
 
@@ -341,7 +341,7 @@ class Congregation:
         weighted_confidence = 0.0
 
         for vote in votes:
-            weight = vote.similarity * (1.0 + vote.supporting_repairs * 0.1)
+            weight = vote.similarity * (1.0 + vote.supporting_repairs * self._config.repair_weight_increment)
             weighted_confidence += vote.confidence * weight
             total_weight += weight
 

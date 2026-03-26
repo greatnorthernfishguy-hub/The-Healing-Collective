@@ -14,6 +14,13 @@ relevant ones into the local DVS — giving the Collective the benefit
 of the entire cluster's repair experience.
 
 # ---- Changelog ----
+# [2026-03-23] Claude Code (Opus 4.6) — Fix _shared_dir AttributeError (#101)
+# What: Guard _peer_bridge._shared_dir access with hasattr check.
+# Why:  NGTractBridge (v0.3+) replaced NGPeerBridge but doesn't have
+#   _shared_dir attribute. Crashed during hook init, preventing THC from
+#   loading in the fan-out. Law 4: fix at the source.
+# How:  Added hasattr check before accessing _shared_dir. Falls through
+#   to the existing default path fallback on line 118.
 # [2026-02-27] Claude (Opus 4.6) — Initial creation.
 #   What: Tier3Coordinator with repair broadcast, cluster sync,
 #         and cluster-wide confidence aggregation.
@@ -112,7 +119,9 @@ class Tier3Coordinator:
 
         if shared_dir:
             self._shared_dir = Path(shared_dir)
-        elif ng_ecosystem and getattr(ng_ecosystem, "_peer_bridge", None):
+        elif (ng_ecosystem
+              and getattr(ng_ecosystem, "_peer_bridge", None)
+              and hasattr(ng_ecosystem._peer_bridge, "_shared_dir")):
             self._shared_dir = ng_ecosystem._peer_bridge._shared_dir
         else:
             self._shared_dir = Path.home() / ".et_modules" / "shared_learning"

@@ -39,6 +39,8 @@ class HealthMonitorConfig:
     weight_divergence_threshold: float = 2.0
     min_firing_rate: float = 0.001
     novelty_saturation_threshold: float = 0.95
+    dead_node_threshold: float = 0.5       # SVG Phase 3: fraction of dead nodes triggering repair (#76)
+    novelty_probe_count: int = 5           # SVG Phase 3: random embeddings for saturation estimate
 
 
 @dataclass
@@ -48,6 +50,12 @@ class CongregationConfig:
     max_candidates: int = 4
     timeout_seconds: float = 10.0
     require_for_host_repairs: bool = True
+    # SVG Phase 3: peer deliberation thresholds
+    similarity_floor: float = 0.3          # Below = no relevant experience
+    similarity_ceiling: float = 0.7        # Above = "similar patterns seen"
+    default_peer_confidence: float = 0.3   # When similar but no matching primitive
+    repair_weight_increment: float = 0.1   # Per supporting repair
+    consensus_threshold: float = 0.5       # Min confidence for consensus
 
 
 @dataclass
@@ -93,6 +101,36 @@ class HealingCollectiveConfig:
 
     # Checkpointing (PRD §6.2)
     checkpoint_interval_seconds: int = 300
+
+    # --- SVG Phase 3: substrate's concern — bootstrap scaffolding ---
+    # DVS ranking weights (#71) — determines repair relevance scoring
+    dvs_weight_activation: float = 0.4
+    dvs_weight_cosine: float = 0.3
+    dvs_weight_recency: float = 0.15
+    dvs_weight_success: float = 0.15
+    dvs_recency_days: int = 30             # Days before recency decays to zero
+    dvs_success_bonus: float = 0.2         # Bonus for "success" outcomes
+    dvs_partial_bonus: float = 0.1         # Bonus for "partial" outcomes
+
+    # Health monitor (#76)
+    dead_node_threshold: float = 0.5       # Fraction of dead nodes triggering repair
+    novelty_probe_count: int = 5           # Random embeddings for saturation estimate
+
+    # Congregation — peer deliberation thresholds
+    congregation_similarity_floor: float = 0.3     # Below = no relevant experience
+    congregation_similarity_ceiling: float = 0.7   # Above = "similar patterns seen"
+    congregation_default_peer_confidence: float = 0.3  # When similar but no matching primitive
+    congregation_repair_weight_increment: float = 0.1  # Per supporting repair
+    congregation_consensus_threshold: float = 0.5  # Min confidence for consensus
+
+    # Diagnosis engine
+    diagnosis_novelty_threshold: float = 0.5       # Novelty above = confidence ceiling drops
+    diagnosis_novelty_multiplier: float = 0.5      # Ceiling = 1.0 - novelty * multiplier
+    diagnosis_novelty_floor: float = 0.5           # Minimum confidence ceiling
+    diagnosis_fallback_confidence: float = 0.3     # When no recalled knowledge matches
+    diagnosis_partial_multiplier: float = 0.5      # Partial outcomes at 50% relevance
+    diagnosis_count_bonus_max: float = 0.3         # Max bonus for repeated successes
+    diagnosis_count_bonus_per: float = 0.03        # Per-success increment
 
     # Nested configs
     health_monitor: HealthMonitorConfig = field(default_factory=HealthMonitorConfig)

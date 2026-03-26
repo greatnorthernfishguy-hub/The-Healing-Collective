@@ -191,7 +191,10 @@ class DiagnosisEngine:
             pass
 
         # Novelty-based confidence ceiling: new failures get lower max confidence
-        confidence_ceiling = 1.0 if novelty < 0.5 else max(0.5, 1.0 - novelty * 0.5)
+        n_thresh = self._config.diagnosis_novelty_threshold
+        n_mult = self._config.diagnosis_novelty_multiplier
+        n_floor = self._config.diagnosis_novelty_floor
+        confidence_ceiling = 1.0 if novelty < n_thresh else max(n_floor, 1.0 - novelty * n_mult)
 
         # --- Step 3: Recall ---
         recalled = self._dvs.search(
@@ -418,7 +421,7 @@ class DiagnosisEngine:
         """
         if not recalled:
             # No recalled knowledge — fallback to log_and_recommend
-            return "log_and_recommend", min(0.3, confidence_ceiling)
+            return "log_and_recommend", min(self._config.diagnosis_fallback_confidence, confidence_ceiling)
 
         # Tally successful repair primitives from recalled entries
         primitive_scores: Dict[str, List[float]] = {}
@@ -434,7 +437,7 @@ class DiagnosisEngine:
             if outcome == "success":
                 score = relevance_score * entry.confidence
             elif outcome == "partial":
-                score = relevance_score * entry.confidence * 0.5
+                score = relevance_score * entry.confidence * self._config.diagnosis_partial_multiplier
             else:
                 score = 0.0
 
@@ -443,7 +446,7 @@ class DiagnosisEngine:
             primitive_scores[primitive].append(score)
 
         if not primitive_scores:
-            return "log_and_recommend", min(0.3, confidence_ceiling)
+            return "log_and_recommend", min(self._config.diagnosis_fallback_confidence, confidence_ceiling)
 
         # Pick the primitive with the highest aggregate score
         best_primitive = None
@@ -452,7 +455,10 @@ class DiagnosisEngine:
         for primitive, scores in primitive_scores.items():
             # Confidence grows with repetition and consistency
             avg_score = sum(scores) / len(scores)
-            count_bonus = min(0.3, len(scores) * 0.03)  # Up to 0.3 bonus for 10+ successes
+            count_bonus = min(
+                self._config.diagnosis_count_bonus_max,
+                len(scores) * self._config.diagnosis_count_bonus_per,
+            )
             confidence = min(avg_score + count_bonus, confidence_ceiling)
 
             if confidence > best_confidence:
@@ -460,7 +466,7 @@ class DiagnosisEngine:
                 best_primitive = primitive
 
         if best_primitive is None:
-            return "log_and_recommend", min(0.3, confidence_ceiling)
+            return "log_and_recommend", min(self._config.diagnosis_fallback_confidence, confidence_ceiling)
 
         return best_primitive, best_confidence
 

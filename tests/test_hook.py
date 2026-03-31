@@ -5,6 +5,11 @@ Tests the hook WITHOUT requiring the full OpenClawAdapter ecosystem
 by mocking ng_ecosystem.init().
 
 # ---- Changelog ----
+# [2026-03-26] Claude Code Opus — Punchlist #102: Fix stale tests from embedding migration
+# What: Updated test dimensions from 384→768 to match current embedding pipeline
+# Why: Punchlist #102 — tests obsoleted by snowflake-arctic-embed-m-v1.5 migration
+# How: Updated _hash_embed default dims from 384→768
+# -------------------
 # [2026-03-18] Claude (CC) — Updated TestMessageScanning for substrate detection
 # What: Rewrote failure detection tests to match new substrate-based
 #   detection (punch list #70). Old tests used regex pattern matching;
@@ -33,7 +38,7 @@ import numpy as np
 import pytest
 
 
-def _hash_embed(text: str, dims: int = 384) -> np.ndarray:
+def _hash_embed(text: str, dims: int = 768) -> np.ndarray:
     """Deterministic hash-based embedding for testing."""
     rng_seed = int(hashlib.sha256(text.encode()).hexdigest(), 16) % (2**32)
     rng = np.random.RandomState(rng_seed)

@@ -24,6 +24,18 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-03-28] Claude (Opus 4.6) — Add autonomic pulse loop (#109)
+# What: Added _pulse_loop() daemon thread following the Tonic pattern.
+#   Added _shutdown_event, _in_conversation flag, dual-interval support,
+#   on_conversation_started/ended() methods.
+# Why: #109 — Modules must be alive between conversations. THC was only
+#   active during fan-out. The pulse loop drains River tracts for peer
+#   repair knowledge and syncs cluster knowledge continuously.
+# How: _pulse_loop() runs as a daemon thread started at the end of
+#   __init__. Each cycle drains peer bridge tracts and syncs tier3
+#   cluster knowledge. Resting interval 30s, conversation interval 10s.
+#   Existing health monitor, compression, and checkpoint threads unchanged.
+# -------------------
 # [2026-03-19] Claude Code (Opus 4.6) — Migrate to BAAI/bge-base-en-v1.5 (#45)
 # What: fastembed model all-MiniLM-L6-v2 → BAAI/bge-base-en-v1.5 (768-dim).
 # Why: Ecosystem-wide embedding migration. Punchlist #45.
@@ -205,6 +217,19 @@ class HealingCollectiveHook(OpenClawAdapter):
         # Signal handlers for graceful shutdown
         self._register_shutdown_handlers()
 
+        # --- Pulse loop (#109) ---
+        self._shutdown_event = threading.Event()
+        self._in_conversation = False
+        self._resting_interval = 30.0
+        self._conversation_interval = 10.0
+
+        self._pulse_thread = threading.Thread(
+            target=self._pulse_loop,
+            name="thc-pulse",
+            daemon=True,
+        )
+        self._pulse_thread.start()
+
         logger.info(
             "[%s] Healing Collective ready (tier %d, %d DVS entries, %d primitives, "
             "health_monitor=%s, congregation=%s, compression=%s, tier3=%s)",
@@ -355,6 +380,55 @@ class HealingCollectiveHook(OpenClawAdapter):
         return stats
 
     # -----------------------------------------------------------------
+    # Pulse loop (#109) — autonomous between-conversation processing
+    # -----------------------------------------------------------------
+
+    def _pulse_loop(self) -> None:
+        """Continuous autonomic pulse — the organ stays alive between conversations.
+
+        Follows the Tonic pattern (tonic_engine.py _generation_loop).
+        Each cycle drains River tracts for peer repair knowledge and
+        syncs cluster knowledge from the tier3 coordinator.
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                self._pulse_cycle()
+            except Exception as exc:
+                logger.debug("THC pulse cycle error: %s", exc)
+            interval = (
+                self._conversation_interval
+                if self._in_conversation
+                else self._resting_interval
+            )
+            self._shutdown_event.wait(timeout=interval)
+
+    def _pulse_cycle(self) -> None:
+        """Single pulse cycle — drain River tracts + sync cluster knowledge."""
+        # Drain River tracts for peer repair knowledge
+        if self._eco and self._eco._peer_bridge is not None:
+            try:
+                self._eco._peer_bridge.sync_state(
+                    local_state={},
+                    module_id=self.MODULE_ID,
+                )
+            except Exception as exc:
+                logger.debug("Pulse tract drain failed: %s", exc)
+
+        # Sync cluster knowledge from tier3 coordinator
+        try:
+            self._tier3.sync_cluster_knowledge()
+        except Exception as exc:
+            logger.debug("Pulse tier3 sync failed: %s", exc)
+
+    def on_conversation_started(self) -> None:
+        """Mode swap: conversation active — shorter pulse interval."""
+        self._in_conversation = True
+
+    def on_conversation_ended(self) -> None:
+        """Mode swap: conversation ended — longer pulse interval."""
+        self._in_conversation = False
+
+    # -----------------------------------------------------------------
     # Public API: Channel 2 Host API
     # -----------------------------------------------------------------
 
@@ -470,6 +544,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         def _shutdown_handler(signum, frame):
             logger.info("Shutdown signal received, saving state...")
             try:
+                self._shutdown_event.set()
                 self._health_monitor.stop()
                 if self._compression_timer:
                     self._compression_timer.cancel()

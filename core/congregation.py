@@ -207,7 +207,7 @@ class Congregation:
             return votes
 
         try:
-            bridge = self._eco._peer_bridge
+            bridge = self._eco._peer_bridge if self._eco else None
             shared_dir = bridge._shared_dir
 
             if not shared_dir.exists():
@@ -217,7 +217,7 @@ class Congregation:
 
             for event_file in shared_dir.glob("*.jsonl"):
                 peer_module = event_file.stem
-                if peer_module == self._eco.module_id:
+                if peer_module == (self._eco.module_id if self._eco else "healing_collective"):
                     continue  # Skip own events
                 if peer_module.startswith("_"):
                     continue  # Skip registry files

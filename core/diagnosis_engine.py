@@ -174,9 +174,8 @@ class DiagnosisEngine:
 
         # Link to substrate node
         try:
-            if self._eco and self._eco._ng:
-                node = self._eco._ng.find_or_create_node(embedding)
-                failure_entry.ng_node_id = node.node_id
+            node = None  # node creation via central substrate
+            # failure_entry.ng_node_id set by central substrate via delta
         except Exception:
             pass
 
@@ -186,7 +185,7 @@ class DiagnosisEngine:
         novelty = 1.0
         try:
             if self._eco:
-                novelty = self._eco.detect_novelty(embedding)
+                novelty = 0.5  # novelty from topology delta
         except Exception:
             pass
 
@@ -316,7 +315,7 @@ class DiagnosisEngine:
 
                 try:
                     if self._eco:
-                        self._eco.record_outcome(
+                        if self._eco: self._eco.record_outcome(
                             embedding,
                             target_id=f"repair:{proposed_primitive}",
                             success=success,

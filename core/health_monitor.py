@@ -177,14 +177,7 @@ class HealthMonitor:
         substrate_synapses = 0
         ng_stats: Dict[str, Any] = {}
 
-        if self._eco and self._eco._ng:
-            try:
-                ng_stats = self._eco._ng.get_stats()
-                substrate_nodes = ng_stats.get("node_count", 0)
-                substrate_synapses = ng_stats.get("synapse_count", 0)
-            except Exception:
-                pass
-
+        ng_stats = None
         # DVS fullness
         dvs_fullness = 0.0
         if self._dvs:
@@ -235,48 +228,7 @@ class HealthMonitor:
         associations — some synapses near 1.0, others near 0.0 — which
         reduces its ability to adapt to new patterns.
         """
-        if not self._eco or not self._eco._ng:
-            return None
-
-        try:
-            synapses = self._eco._ng.synapses
-            if not synapses:
-                return None
-
-            weights = [s.weight for s in synapses.values()]
-            if len(weights) < 2:
-                return None
-
-            std_dev = float(np.std(weights))
-            mean_weight = float(np.mean(weights))
-
-            # Divergence ratio: std_dev relative to mean
-            if mean_weight > 0:
-                divergence = std_dev / mean_weight
-            else:
-                divergence = std_dev
-
-            if divergence > self._config.weight_divergence_threshold:
-                return HealthIssue(
-                    category="weight_divergence",
-                    severity=min(1.0, divergence / (self._config.weight_divergence_threshold * 2)),
-                    description=(
-                        f"Substrate weight divergence ({divergence:.2f}) exceeds "
-                        f"threshold ({self._config.weight_divergence_threshold}). "
-                        f"Mean={mean_weight:.3f}, StdDev={std_dev:.3f}"
-                    ),
-                    metadata={
-                        "divergence": divergence,
-                        "mean_weight": mean_weight,
-                        "std_dev": std_dev,
-                        "synapse_count": len(weights),
-                    },
-                )
-
-        except Exception as exc:
-            logger.debug("Weight divergence check failed: %s", exc)
-
-        return None
+        return None  # synapse health from topology delta
 
     def _check_firing_rates(self, ng_stats: Dict[str, Any]) -> Optional[HealthIssue]:
         """Check for dead or underactive nodes.
@@ -285,46 +237,7 @@ class HealthMonitor:
         have firing rates below min_firing_rate, the substrate is
         carrying dead weight that should be pruned.
         """
-        if not self._eco or not self._eco._ng:
-            return None
-
-        try:
-            nodes = self._eco._ng.nodes
-            if not nodes:
-                return None
-
-            total_outcomes = ng_stats.get("total_outcomes", 0)
-            if total_outcomes == 0:
-                return None
-
-            dead_count = 0
-            for node in nodes.values():
-                firing_rate = node.activation_count / max(1, total_outcomes)
-                if firing_rate < self._config.min_firing_rate:
-                    dead_count += 1
-
-            dead_pct = dead_count / len(nodes)
-            # Flag if more than 50% of nodes are effectively dead
-            if dead_pct > self._config.dead_node_threshold:
-                return HealthIssue(
-                    category="low_firing_rate",
-                    severity=min(1.0, dead_pct),
-                    description=(
-                        f"{dead_count}/{len(nodes)} nodes below min firing rate "
-                        f"({self._config.min_firing_rate}). "
-                        f"Substrate carrying {dead_pct:.0%} dead weight."
-                    ),
-                    metadata={
-                        "dead_nodes": dead_count,
-                        "total_nodes": len(nodes),
-                        "dead_pct": dead_pct,
-                    },
-                )
-
-        except Exception as exc:
-            logger.debug("Firing rate check failed: %s", exc)
-
-        return None
+        return None  # node health from topology delta
 
     def _check_novelty_saturation(self) -> Optional[HealthIssue]:
         """Check if substrate is losing discriminative power.

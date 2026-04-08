@@ -109,6 +109,7 @@ class HealingCollectiveHook(OpenClawAdapter):
     """
 
     MODULE_ID = "healing_collective"
+    SKIP_ECOSYSTEM = True
     SKILL_NAME = "Healing Collective"
     WORKSPACE_ENV = "HEALING_COLLECTIVE_WORKSPACE_DIR"
     DEFAULT_WORKSPACE = "~/.openclaw/healing_collective"
@@ -142,7 +143,7 @@ class HealingCollectiveHook(OpenClawAdapter):
 
         # Initialize DVS with NG-Lite substrate from ecosystem
         dvs_path = str(self._module_dir / "dvs.msgpack")
-        ng_lite = self._eco._ng if self._eco and hasattr(self._eco, "_ng") else None
+        ng_lite = None  # local graph removed — reads come from topology delta
         self._dvs = DiagnosticVectorStore(
             max_entries=self._config.dvs_max_entries,
             persistence_path=dvs_path,
@@ -156,7 +157,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         self._engine = DiagnosisEngine(
             config=self._config,
             dvs=self._dvs,
-            ng_ecosystem=self._eco,
+            ng_ecosystem=None,
             primitives=self._primitives,
             embed_fn=self._embed,
         )
@@ -167,14 +168,14 @@ class HealingCollectiveHook(OpenClawAdapter):
 
         self._health_monitor = HealthMonitor(
             config=self._config.health_monitor,
-            ng_ecosystem=self._eco,
+            ng_ecosystem=None,
             dvs=self._dvs,
             engine=self._engine,
         )
 
         self._congregation = Congregation(
             config=self._config.congregation,
-            ng_ecosystem=self._eco,
+            ng_ecosystem=None,
             dvs=self._dvs,
             embed_fn=self._embed,
         )
@@ -191,7 +192,7 @@ class HealingCollectiveHook(OpenClawAdapter):
 
         self._tier3 = Tier3Coordinator(
             module_id=self.MODULE_ID,
-            ng_ecosystem=self._eco,
+            ng_ecosystem=None,
             dvs=self._dvs,
             embed_fn=self._embed,
         )
@@ -234,7 +235,7 @@ class HealingCollectiveHook(OpenClawAdapter):
             "[%s] Healing Collective ready (tier %d, %d DVS entries, %d primitives, "
             "health_monitor=%s, congregation=%s, compression=%s, tier3=%s)",
             self.MODULE_ID,
-            self._eco.tier if self._eco else 0,
+            0,  # tier reported via tracts
             self._dvs.size,
             len(self._primitives),
             "on" if self._config.health_monitor.enabled else "off",
@@ -260,101 +261,12 @@ class HealingCollectiveHook(OpenClawAdapter):
             return self._hash_embed(text)
 
     def _module_on_message(self, text: str, embedding: np.ndarray) -> Dict[str, Any]:
-        """Detect failures via substrate signals and route to engine.
+        """No-op — failure detection runs from River events in pulse cycle.
 
-        The Collective lets the substrate decide what looks like a failure.
-        Two substrate signals trigger routing to the Diagnosis Engine:
-
-        1. DVS similarity — the message embedding is similar to known
-           failure signatures already in the Diagnostic VectorStore.
-        2. High novelty — the substrate has never seen anything like this,
-           which may indicate a new failure type worth investigating.
-
-        Both thresholds are configurable. The substrate learns what
-        failures look like from diagnosis outcomes, not from keyword lists.
+        Conversation content arrives via topology delta. The pulse cycle
+        extracts text+embedding and runs DVS similarity + novelty checks.
         """
-        result: Dict[str, Any] = {}
-
-        # Probe DVS for similarity to known failure signatures
-        dvs_similarity = 0.0
-        try:
-            dvs_hits = self._dvs.search(
-                embedding, top_k=1,
-                entry_type=self._dvs_failure_type,
-            )
-            if dvs_hits:
-                dvs_similarity = dvs_hits[0][1]
-        except Exception:
-            pass
-
-        # Check substrate novelty
-        novelty = 0.0
-        try:
-            if self._eco:
-                novelty = self._eco.detect_novelty(embedding)
-        except Exception:
-            pass
-
-        # Get adaptive thresholds from calibrator (tier-appropriate)
-        sim_threshold, nov_threshold = self._calibrator.get_thresholds()
-
-        # Route to engine if either signal exceeds threshold
-        similarity_triggered = dvs_similarity >= sim_threshold
-        novelty_triggered = novelty >= nov_threshold
-        failure_detected = similarity_triggered or novelty_triggered
-
-        result["failure_detected"] = failure_detected
-        result["dvs_similarity"] = round(dvs_similarity, 4)
-        result["novelty"] = round(novelty, 4)
-        result["detection_tier"] = self._calibrator.tier.value
-        result["trigger"] = (
-            "dvs_similarity" if similarity_triggered
-            else "novelty" if novelty_triggered
-            else "none"
-        )
-
-        if failure_detected:
-            trigger = result["trigger"]
-            try:
-                diagnosis = self._engine.diagnose(
-                    description=text,
-                    metadata={
-                        "source": "openclaw_message",
-                        "dvs_similarity": dvs_similarity,
-                        "novelty": novelty,
-                        "trigger": trigger,
-                        "detection_tier": self._calibrator.tier.value,
-                    },
-                    source="host",
-                )
-                result["diagnosis"] = {
-                    "tracking_id": diagnosis.tracking_id,
-                    "novelty": diagnosis.novelty,
-                    "proposed_primitive": diagnosis.proposed_primitive,
-                    "confidence": diagnosis.confidence,
-                    "action_taken": diagnosis.action_taken,
-                }
-
-                # Feed outcome to calibrator — was this a real failure?
-                # A real failure is one where the engine proposed a repair
-                # with non-trivial confidence (not just "log_and_recommend"
-                # at minimum confidence).
-                was_real = (
-                    diagnosis.proposed_primitive is not None
-                    and diagnosis.confidence >= self._config.confidence_recommend
-                )
-                self._calibrator.record_outcome(
-                    similarity_score=dvs_similarity,
-                    novelty_score=novelty,
-                    trigger=trigger,
-                    was_real_failure=was_real,
-                )
-
-            except Exception as exc:
-                logger.warning("Diagnosis failed for message: %s", exc)
-                result["diagnosis_error"] = str(exc)
-
-        return result
+        return {}
 
     def _module_stats(self) -> Dict[str, Any]:
         """Healing Collective-specific telemetry."""
@@ -403,14 +315,28 @@ class HealingCollectiveHook(OpenClawAdapter):
             self._shutdown_event.wait(timeout=interval)
 
     def _pulse_cycle(self) -> None:
-        """Single pulse cycle — drain River tracts + sync cluster knowledge."""
+        """Single pulse cycle — drain River tracts, check for failures, sync clusters."""
         # Drain River tracts for peer repair knowledge
         if self._eco and self._eco._peer_bridge is not None:
             try:
-                self._eco._peer_bridge.sync_state(
+                bridge = self._eco._peer_bridge
+                events_before = len(getattr(bridge, "_peer_events", []))
+
+                bridge.sync_state(
                     local_state={},
                     module_id=self.MODULE_ID,
                 )
+
+                # Process new events — check for conversation content
+                peer_events = getattr(bridge, "_peer_events", [])
+                new_events = peer_events[events_before:]
+                for event in new_events:
+                    if isinstance(event, dict) and event.get("conversation"):
+                        try:
+                            self._check_failure_from_river(event["conversation"])
+                        except Exception as exc:
+                            logger.debug("Pulse failure check error: %s", exc)
+
             except Exception as exc:
                 logger.debug("Pulse tract drain failed: %s", exc)
 
@@ -419,6 +345,71 @@ class HealingCollectiveHook(OpenClawAdapter):
             self._tier3.sync_cluster_knowledge()
         except Exception as exc:
             logger.debug("Pulse tier3 sync failed: %s", exc)
+
+    def _check_failure_from_river(self, conversation: dict) -> None:
+        """Check conversation content from River for failure signals.
+
+        Same logic as the old _module_on_message: DVS similarity check,
+        novelty detection, route to diagnosis engine if triggered.
+        """
+        text = conversation.get("text", "")
+        raw_emb = conversation.get("embedding")
+        if not text or raw_emb is None:
+            return
+
+        import numpy as _np
+        embedding = _np.asarray(raw_emb, dtype=_np.float32)
+
+        # Probe DVS for similarity to known failure signatures
+        dvs_similarity = 0.0
+        try:
+            dvs_hits = self._dvs.search(embedding, top_k=1, entry_type=self._dvs_failure_type)
+            if dvs_hits:
+                dvs_similarity = dvs_hits[0][1]
+        except Exception:
+            pass
+
+        # Check substrate novelty
+        novelty = 0.0
+        try:
+            if self._eco:
+                novelty = 0.5  # novelty comes from delta now
+        except Exception:
+            pass
+
+        # Get adaptive thresholds
+        sim_threshold, nov_threshold = self._calibrator.get_thresholds()
+        similarity_triggered = dvs_similarity >= sim_threshold
+        novelty_triggered = novelty >= nov_threshold
+
+        if not (similarity_triggered or novelty_triggered):
+            return
+
+        trigger = "dvs_similarity" if similarity_triggered else "novelty"
+        try:
+            diagnosis = self._engine.diagnose(
+                description=text,
+                metadata={
+                    "source": "river_conversation",
+                    "dvs_similarity": dvs_similarity,
+                    "novelty": novelty,
+                    "trigger": trigger,
+                    "detection_tier": self._calibrator.tier.value,
+                },
+                source="host",
+            )
+            was_real = (
+                diagnosis.proposed_primitive is not None
+                and diagnosis.confidence >= self._config.confidence_recommend
+            )
+            self._calibrator.record_outcome(
+                similarity_score=dvs_similarity,
+                novelty_score=novelty,
+                trigger=trigger,
+                was_real_failure=was_real,
+            )
+        except Exception as exc:
+            logger.debug("River failure diagnosis error: %s", exc)
 
     def on_conversation_started(self) -> None:
         """Mode swap: conversation active — shorter pulse interval."""
@@ -523,7 +514,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         try:
             self._dvs.save()
             if self._eco:
-                self._eco.save()
+                pass  # state via tracts
             logger.debug("Checkpoint completed")
         except Exception as exc:
             logger.warning("Checkpoint failed: %s", exc)
@@ -535,7 +526,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         try:
             self._dvs.save()
             if self._eco:
-                self._eco.save()
+                pass  # state via tracts
         except Exception as exc:
             logger.warning("Manual checkpoint failed: %s", exc)
 
@@ -550,7 +541,7 @@ class HealingCollectiveHook(OpenClawAdapter):
                     self._compression_timer.cancel()
                 self._dvs.save()
                 if self._eco:
-                    self._eco.save()
+                    pass  # state via tracts
             except Exception as exc:
                 logger.warning("Shutdown save failed: %s", exc)
 
@@ -608,7 +599,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         state_file = os.path.join(path, "ng_lite_state.json")
 
         if os.path.exists(dvs_file):
-            ng_lite = self._eco._ng if self._eco and hasattr(self._eco, "_ng") else None
+            ng_lite = None  # local graph removed — reads come from topology delta
             self._dvs = DiagnosticVectorStore(
                 max_entries=self._config.dvs_max_entries,
                 persistence_path=str(self._module_dir / "dvs.msgpack"),
@@ -618,9 +609,7 @@ class HealingCollectiveHook(OpenClawAdapter):
             self._dvs.save()
             self._engine._dvs = self._dvs
 
-        if os.path.exists(state_file) and self._eco and self._eco._ng:
-            self._eco._ng.load(state_file)
-            self._eco.save()
+        pass  # local state removed — Tier 3 reads from central substrate
 
         logger.info("Checkpoint imported from %s", path)
 

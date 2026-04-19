@@ -24,6 +24,10 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-04-19] Claude Code — #5: replace dead eco drain with _drain_river() + _on_river_events()
+#   What: _pulse_cycle() now calls _drain_river(); failure routing moved to _on_river_events() override
+#   Why: #5 — eco._peer_bridge was dead (SKIP_ECOSYSTEM); BTF drain is in openclaw_adapter base class
+#   How: _on_river_events() receives new BTF events; routes conversation events to _check_failure_from_river()
 # [2026-03-28] Claude (Opus 4.6) — Add autonomic pulse loop (#109)
 # What: Added _pulse_loop() daemon thread following the Tonic pattern.
 #   Added _shutdown_event, _in_conversation flag, dual-interval support,
@@ -316,29 +320,17 @@ class HealingCollectiveHook(OpenClawAdapter):
 
     def _pulse_cycle(self) -> None:
         """Single pulse cycle — drain River tracts, check for failures, sync clusters."""
-        # Drain River tracts for peer repair knowledge
-        if self._eco and self._eco._peer_bridge is not None:
-            try:
-                bridge = self._eco._peer_bridge
-                events_before = len(getattr(bridge, "_peer_events", []))
+        # Drain River tracts via BTF bridge (#5)
+        self._drain_river()
 
-                bridge.sync_state(
-                    local_state={},
-                    module_id=self.MODULE_ID,
-                )
-
-                # Process new events — check for conversation content
-                peer_events = getattr(bridge, "_peer_events", [])
-                new_events = peer_events[events_before:]
-                for event in new_events:
-                    if isinstance(event, dict) and event.get("conversation"):
-                        try:
-                            self._check_failure_from_river(event["conversation"])
-                        except Exception as exc:
-                            logger.debug("Pulse failure check error: %s", exc)
-
-            except Exception as exc:
-                logger.debug("Pulse tract drain failed: %s", exc)
+    def _on_river_events(self, events: list) -> None:
+        """Route new River events through failure-detection bucket."""
+        for event in events:
+            if isinstance(event, dict) and event.get("conversation"):
+                try:
+                    self._check_failure_from_river(event["conversation"])
+                except Exception as exc:
+                    logger.debug("Pulse failure check error: %s", exc)
 
         # Sync cluster knowledge from tier3 coordinator
         try:

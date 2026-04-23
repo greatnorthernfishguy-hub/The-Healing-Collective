@@ -14,7 +14,7 @@
 #   ./install.sh --status     # Check installation status
 #
 # Environment variable overrides:
-#   HC_INSTALL_DIR   — Installation path (default: ~/The-Healing-Collective-)
+#   HC_INSTALL_DIR   — Installation path (default: ~/The-Healing-Collective)
 #
 # Follows the same patterns as TrollGuard's install.sh for consistency
 # across the E-T Systems module ecosystem.

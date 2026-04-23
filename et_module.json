@@ -4,7 +4,7 @@
   "version": "0.4.0",
   "description": "Adaptive self-healing intelligence for the E-T Systems ecosystem",
   "install_path": "/home/josh/The-Healing-Collective",
-  "git_remote": "https://github.com/greatnorthernfishguy-hub/The-Healing-Collective-.git",
+  "git_remote": "https://github.com/greatnorthernfishguy-hub/The-Healing-Collective.git",
   "git_branch": "main",
   "entry_point": "healing_collective_hook.py",
   "ng_lite_version": "",

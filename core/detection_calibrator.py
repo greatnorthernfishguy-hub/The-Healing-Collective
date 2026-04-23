@@ -1,91 +1,91 @@
 """
-Detection Calibrator — Adaptive Failure Detection Thresholds
+Detection Calibrator — Continuous Competence-Based Threshold Adaptation
 
-Manages the three-tier competence model for THC's failure detection:
+Manages THC's failure detection thresholds using a continuous per-parameter
+competence model. Matches Elmer's TuningSocket pattern.
 
-  APPRENTICE  — Static thresholds from config. No drift. The substrate
-                has not seen enough to have opinions yet.
-  JOURNEYMAN  — Substrate-informed drift within bounded range. Enough
-                experience to adapt, not enough to be trusted with extremes.
-  MASTER      — Unbounded substrate authority. Thresholds go wherever the
-                learned distribution says they should. The substrate IS
-                the expert.
+Competence is a continuous [0, 1] value per threshold parameter ("similarity"
+and "novelty"). It grows with accurate detection outcomes (gain=0.05) and
+shrinks with regressions (loss=0.10, asymmetric — trust is hard to build, easy
+to lose). Bootstrap bounds expand as competence rises — the substrate earns a
+wider operating envelope through demonstrated accuracy.
 
-Graduation is competence-based, not time-based. More experience with
-better outcomes = more autonomy. The gates measure what the system has
-learned, not how long it has been running.
-
-The calibrator observes every detection outcome (was the triggered
-diagnosis a real failure or noise?) and periodically recomputes
-optimal thresholds from the distribution of scores.
+Tier names are descriptive regions only, for telemetry and logging:
+  Apprentice region  — competence near 0.0: bootstrap defaults dominate
+  Journeyman region  — competence 0.25–0.75: substrate drift begins
+  Master region      — competence near 1.0: substrate IS the expert
 
 # ---- Changelog ----
+# [2026-04-23] Claude (Sonnet 4.6) — Punchlist #170: migrate to continuous competence
+#   What: Replace discrete CompetenceTier enum + graduation gates with continuous
+#     per-parameter competence drift matching Elmer's TuningSocket.
+#   Why:  Josh directive — tier gates were a mistake. Continuous confidence-weighted
+#     drift is the ecosystem standard. Reference: Elmer/core/tuning.py.
+#   How:  _competence dict per threshold key ("similarity", "novelty"). Asymmetric
+#     gain=0.05/loss=0.10. Bootstrap bounds expand by _BOUNDS_EXPANSION_FACTOR at
+#     full competence. No tier state machine, no graduation check. Backwards-compat
+#     load: old "tier" field ignored; observations preserved; competence starts at 0.
 # [2026-03-18] Claude (CC) — Initial creation
-# What: Three-tier competence model for failure detection thresholds.
-# Why: Static thresholds are bootstrap scaffolding. The substrate should
-#   learn what similarity/novelty scores actually predict real failures,
-#   with autonomy proportional to demonstrated competence.
-# How: Track (score, was_real_failure) observations. Compute optimal
-#   thresholds from score distributions. Clamp to bounds in Journeyman
-#   mode. No clamp in Master mode. Graduate based on outcome count +
-#   accuracy metrics.
+#   What: Three-tier competence model for failure detection thresholds.
+#   Why:  Static thresholds are bootstrap scaffolding. The substrate should learn
+#     what similarity/novelty scores actually predict real failures, with autonomy
+#     proportional to demonstrated competence.
+#   How:  Track (score, was_real_failure) observations. Compute optimal thresholds
+#     from score distributions. Graduate based on outcome count + accuracy metrics.
 # -------------------
 """
 
 from __future__ import annotations
 
-import enum
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("healing_collective.calibrator")
 
+# Competence update rates. Asymmetric: trust is hard to earn, easy to lose.
+_COMPETENCE_GAIN = 0.05    # per accurate detection (true positive)
+_COMPETENCE_LOSS = 0.10    # per regression (false positive) — 2× gain
 
-class CompetenceTier(str, enum.Enum):
-    APPRENTICE = "apprentice"
-    JOURNEYMAN = "journeyman"
-    MASTER = "master"
+# Minimum outcomes before competence can exceed 0.5.
+# Prevents early lucky outcomes from producing overconfidence.
+_MIN_OUTCOMES_FOR_CONFIDENCE = 5
+
+# How much bootstrap bounds expand at full competence (c=1.0).
+# E.g., similarity_bounds (0.25, 0.60) width=0.35 → expands ±0.175 at c=1:
+#   effective bounds (0.075, 0.775)
+_BOUNDS_EXPANSION_FACTOR = 0.5
+
+# Minimum trigger-type observations before adapting that threshold.
+_MIN_OBS_TO_ADAPT = 5
 
 
 @dataclass
 class CalibrationConfig:
-    """Configuration for the detection calibrator.
+    """Configuration for the detection calibrator."""
 
-    All values are fair starting values — Elmer-tunable when Elmer
-    integrates (Key Decision #7).
-    """
-
-    # Apprentice defaults (static thresholds)
+    # Bootstrap defaults (static starting points)
     default_similarity_threshold: float = 0.40
     default_novelty_threshold: float = 0.85
 
-    # Journeyman bounds — drift permitted within this range
+    # Bootstrap bounds — expanded by competence at runtime
     similarity_bounds: Tuple[float, float] = (0.25, 0.60)
     novelty_bounds: Tuple[float, float] = (0.70, 0.95)
 
-    # Graduation gates: Apprentice → Journeyman
-    journeyman_min_outcomes: int = 20       # Diagnosed failures with feedback
-    journeyman_min_true_positives: int = 5  # Confirmed real failures
-
-    # Graduation gates: Journeyman → Master
-    master_min_outcomes: int = 100
-    master_min_accuracy: float = 0.75  # True positive rate over all outcomes
-
-    # Recompute interval — recalibrate after this many new observations
+    # Recalibrate after this many new observations
     recalibrate_every: int = 10
 
 
 @dataclass
 class DetectionObservation:
     """A single observation for calibration learning."""
-    similarity_score: float     # DVS similarity when detection triggered
-    novelty_score: float        # Substrate novelty when detection triggered
+    similarity_score: float
+    novelty_score: float
     trigger: str                # "dvs_similarity" or "novelty"
-    was_real_failure: bool      # Did diagnosis confirm a real failure?
+    was_real_failure: bool
     timestamp: float = 0.0
 
     def __post_init__(self):
@@ -94,24 +94,19 @@ class DetectionObservation:
 
 
 class DetectionCalibrator:
-    """Adaptive threshold calibration with three-tier competence model.
+    """Adaptive threshold calibration with continuous per-parameter competence.
+
+    Competence is a continuous [0, 1] value per threshold parameter. It grows
+    with accurate detections and shrinks with false positives. Bootstrap bounds
+    expand as competence rises — no discrete tier gates.
 
     Usage:
         calibrator = DetectionCalibrator(config, persistence_path)
-
-        # Get current thresholds (tier-appropriate)
         sim_thresh, nov_thresh = calibrator.get_thresholds()
-
-        # After a detection triggers diagnosis, record the outcome
         calibrator.record_outcome(
-            similarity_score=0.45,
-            novelty_score=0.30,
-            trigger="dvs_similarity",
-            was_real_failure=True,
+            similarity_score=0.45, novelty_score=0.30,
+            trigger="dvs_similarity", was_real_failure=True,
         )
-
-        # Check current tier
-        tier = calibrator.tier  # APPRENTICE, JOURNEYMAN, or MASTER
     """
 
     def __init__(
@@ -123,30 +118,82 @@ class DetectionCalibrator:
         self._persistence_path = persistence_path
 
         self._observations: List[DetectionObservation] = []
-        self._tier = CompetenceTier.APPRENTICE
-
-        # Current adaptive thresholds (start at defaults)
         self._similarity_threshold = self._config.default_similarity_threshold
         self._novelty_threshold = self._config.default_novelty_threshold
 
-        # Counter for triggering recalibration
+        # Per-parameter competence: continuous [0, 1], starts at 0 (no evidence).
+        self._competence: Dict[str, float] = {"similarity": 0.0, "novelty": 0.0}
+        self._outcome_counts: Dict[str, int] = {"similarity": 0, "novelty": 0}
+
         self._observations_since_calibration = 0
 
-        # Load persisted state if available
         if persistence_path:
             self._load(persistence_path)
 
+    # -------------------------------------------------------------------
+    # Competence
+    # -------------------------------------------------------------------
+
+    def get_competence(self, key: str) -> float:
+        """Return current competence for a parameter. 0 = no evidence."""
+        raw = self._competence.get(key, 0.0)
+        outcomes = self._outcome_counts.get(key, 0)
+        if outcomes < _MIN_OUTCOMES_FOR_CONFIDENCE:
+            cap = outcomes / _MIN_OUTCOMES_FOR_CONFIDENCE * 0.5
+            return min(raw, cap)
+        return raw
+
+    def _update_competence(self, key: str, was_real_failure: bool) -> float:
+        """Update competence based on detection accuracy.
+
+        True positive (real failure detected) → gain competence.
+        False positive (noise triggered) → lose competence.
+        """
+        current = self._competence.get(key, 0.0)
+        self._outcome_counts[key] = self._outcome_counts.get(key, 0) + 1
+
+        if was_real_failure:
+            new = current + _COMPETENCE_GAIN * (1.0 - current)
+        else:
+            new = current - _COMPETENCE_LOSS * current
+
+        new = max(0.0, min(1.0, new))
+        self._competence[key] = new
+        logger.debug("Competence %s: %.3f → %.3f", key, current, new)
+        return new
+
+    def _effective_bounds(self, key: str) -> Tuple[float, float]:
+        """Bootstrap bounds expanded by competence.
+
+        At c=0 returns bootstrap bounds. At c=1 expands by
+        _BOUNDS_EXPANSION_FACTOR in each direction.
+        """
+        c = self.get_competence(key)
+        lo, hi = (
+            self._config.similarity_bounds
+            if key == "similarity"
+            else self._config.novelty_bounds
+        )
+        width = hi - lo
+        expansion = width * _BOUNDS_EXPANSION_FACTOR * c
+        return (max(0.0, lo - expansion), min(1.0, hi + expansion))
+
+    # -------------------------------------------------------------------
+    # Public interface
+    # -------------------------------------------------------------------
+
     @property
-    def tier(self) -> CompetenceTier:
-        return self._tier
+    def tier(self) -> str:
+        """Descriptive competence region — for telemetry only, not a gate."""
+        avg_c = sum(self._competence.values()) / max(len(self._competence), 1)
+        if avg_c < 0.25:
+            return "apprentice"
+        elif avg_c < 0.75:
+            return "journeyman"
+        return "master"
 
     def get_thresholds(self) -> Tuple[float, float]:
-        """Return current (similarity_threshold, novelty_threshold).
-
-        In APPRENTICE mode, returns static defaults.
-        In JOURNEYMAN mode, returns substrate-adapted values clamped to bounds.
-        In MASTER mode, returns substrate-adapted values without bounds.
-        """
+        """Return (similarity_threshold, novelty_threshold)."""
         return self._similarity_threshold, self._novelty_threshold
 
     def record_outcome(
@@ -156,11 +203,7 @@ class DetectionCalibrator:
         trigger: str,
         was_real_failure: bool,
     ) -> None:
-        """Record a detection outcome for calibration learning.
-
-        Call this after a triggered detection has been diagnosed and
-        the outcome is known (real failure vs noise/false positive).
-        """
+        """Record a detection outcome and update competence."""
         obs = DetectionObservation(
             similarity_score=similarity_score,
             novelty_score=novelty_score,
@@ -170,15 +213,13 @@ class DetectionCalibrator:
         self._observations.append(obs)
         self._observations_since_calibration += 1
 
-        # Check graduation
-        self._evaluate_graduation()
+        key = "similarity" if trigger == "dvs_similarity" else "novelty"
+        self._update_competence(key, was_real_failure)
 
-        # Recalibrate periodically
         if self._observations_since_calibration >= self._config.recalibrate_every:
             self._recalibrate()
             self._observations_since_calibration = 0
 
-        # Persist
         if self._persistence_path:
             self._save(self._persistence_path)
 
@@ -186,13 +227,13 @@ class DetectionCalibrator:
         """Calibrator statistics for telemetry."""
         total = len(self._observations)
         true_positives = sum(1 for o in self._observations if o.was_real_failure)
-        false_positives = total - true_positives
-
         return {
-            "tier": self._tier.value,
+            "tier": self.tier,
+            "competence_similarity": round(self.get_competence("similarity"), 4),
+            "competence_novelty": round(self.get_competence("novelty"), 4),
             "total_observations": total,
             "true_positives": true_positives,
-            "false_positives": false_positives,
+            "false_positives": total - true_positives,
             "accuracy": true_positives / total if total > 0 else 0.0,
             "similarity_threshold": round(self._similarity_threshold, 4),
             "novelty_threshold": round(self._novelty_threshold, 4),
@@ -200,86 +241,39 @@ class DetectionCalibrator:
             "default_novelty": self._config.default_novelty_threshold,
         }
 
-    # -----------------------------------------------------------------
-    # Graduation
-    # -----------------------------------------------------------------
-
-    def _evaluate_graduation(self) -> None:
-        """Check whether competence warrants tier promotion."""
-        total = len(self._observations)
-        true_positives = sum(1 for o in self._observations if o.was_real_failure)
-        accuracy = true_positives / total if total > 0 else 0.0
-
-        if self._tier == CompetenceTier.APPRENTICE:
-            if (
-                total >= self._config.journeyman_min_outcomes
-                and true_positives >= self._config.journeyman_min_true_positives
-            ):
-                self._tier = CompetenceTier.JOURNEYMAN
-                self._recalibrate()
-                logger.info(
-                    "Detection calibrator graduated to JOURNEYMAN "
-                    "(outcomes=%d, true_positives=%d)",
-                    total, true_positives,
-                )
-
-        elif self._tier == CompetenceTier.JOURNEYMAN:
-            if (
-                total >= self._config.master_min_outcomes
-                and accuracy >= self._config.master_min_accuracy
-            ):
-                self._tier = CompetenceTier.MASTER
-                self._recalibrate()
-                logger.info(
-                    "Detection calibrator graduated to MASTER "
-                    "(outcomes=%d, accuracy=%.2f)",
-                    total, accuracy,
-                )
-
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Recalibration
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------
 
     def _recalibrate(self) -> None:
         """Recompute thresholds from observed score distributions.
 
-        APPRENTICE: No-op. Static thresholds.
-        JOURNEYMAN: Adapt within bounds.
-        MASTER: Adapt without bounds.
+        Always runs (no APPRENTICE no-op). Stays at defaults when insufficient
+        observations for a trigger type. Bounds expand with competence.
         """
-        if self._tier == CompetenceTier.APPRENTICE:
-            return
-
-        # Separate observations by trigger type
         sim_obs = [o for o in self._observations if o.trigger == "dvs_similarity"]
         nov_obs = [o for o in self._observations if o.trigger == "novelty"]
 
-        # Compute optimal similarity threshold
-        if len(sim_obs) >= 5:
-            self._similarity_threshold = self._compute_optimal_threshold(
+        if len(sim_obs) >= _MIN_OBS_TO_ADAPT:
+            optimal = self._compute_optimal_threshold(
                 scores=[(o.similarity_score, o.was_real_failure) for o in sim_obs],
                 default=self._config.default_similarity_threshold,
             )
+            lo, hi = self._effective_bounds("similarity")
+            self._similarity_threshold = max(lo, min(hi, optimal))
 
-        # Compute optimal novelty threshold
-        if len(nov_obs) >= 5:
-            self._novelty_threshold = self._compute_optimal_threshold(
+        if len(nov_obs) >= _MIN_OBS_TO_ADAPT:
+            optimal = self._compute_optimal_threshold(
                 scores=[(o.novelty_score, o.was_real_failure) for o in nov_obs],
                 default=self._config.default_novelty_threshold,
             )
-
-        # Apply bounds in Journeyman mode
-        if self._tier == CompetenceTier.JOURNEYMAN:
-            sim_lo, sim_hi = self._config.similarity_bounds
-            nov_lo, nov_hi = self._config.novelty_bounds
-            self._similarity_threshold = max(sim_lo, min(sim_hi, self._similarity_threshold))
-            self._novelty_threshold = max(nov_lo, min(nov_hi, self._novelty_threshold))
-
-        # Master mode: no clamping. The substrate is the expert.
+            lo, hi = self._effective_bounds("novelty")
+            self._novelty_threshold = max(lo, min(hi, optimal))
 
         logger.info(
-            "Recalibrated thresholds (tier=%s): similarity=%.3f, novelty=%.3f",
-            self._tier.value,
+            "Recalibrated (sim_c=%.3f, nov_c=%.3f): sim=%.3f, nov=%.3f",
+            self.get_competence("similarity"),
+            self.get_competence("novelty"),
             self._similarity_threshold,
             self._novelty_threshold,
         )
@@ -289,46 +283,36 @@ class DetectionCalibrator:
         scores: List[Tuple[float, bool]],
         default: float,
     ) -> float:
-        """Find the threshold that best separates real failures from noise.
+        """Midpoint between true-positive and false-positive score distributions.
 
-        Uses a simple approach: find the score that maximizes the gap
-        between the mean score of true positives and the mean score of
-        false positives. The optimal threshold sits between the two means.
-
-        If there's insufficient separation, returns the default.
+        Returns default if distributions are too similar (gap < 0.05).
         """
         true_scores = [s for s, is_real in scores if is_real]
         false_scores = [s for s, is_real in scores if not is_real]
 
         if not true_scores or not false_scores:
-            # Can't separate without both classes
             if true_scores:
-                # Only real failures seen — threshold just below the minimum
                 return max(0.0, min(true_scores) - 0.05)
             return default
 
         true_mean = sum(true_scores) / len(true_scores)
         false_mean = sum(false_scores) / len(false_scores)
 
-        # Midpoint between the two distributions
-        midpoint = (true_mean + false_mean) / 2.0
-
-        # If the distributions overlap heavily (means within 0.05),
-        # the signal isn't clean enough — lean toward the default
         if abs(true_mean - false_mean) < 0.05:
             return default
 
-        return midpoint
+        return (true_mean + false_mean) / 2.0
 
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Persistence
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------
 
     def _save(self, path: str) -> None:
         """Persist calibration state."""
         try:
             state = {
-                "tier": self._tier.value,
+                "competence": self._competence,
+                "outcome_counts": self._outcome_counts,
                 "similarity_threshold": self._similarity_threshold,
                 "novelty_threshold": self._novelty_threshold,
                 "observations": [
@@ -351,14 +335,24 @@ class DetectionCalibrator:
             logger.debug("Calibration save failed: %s", exc)
 
     def _load(self, path: str) -> None:
-        """Load persisted calibration state."""
+        """Load persisted calibration state.
+
+        Backwards compatible: old \"tier\" field silently ignored.
+        Competence starts at 0.0 for migrated instances — conservative default.
+        """
         try:
             p = Path(path)
             if not p.exists():
                 return
             state = json.loads(p.read_text())
 
-            self._tier = CompetenceTier(state.get("tier", "apprentice"))
+            if "competence" in state:
+                self._competence.update(state["competence"])
+            # Old "tier" field silently dropped — competence starts at 0.0.
+
+            if "outcome_counts" in state:
+                self._outcome_counts.update(state["outcome_counts"])
+
             self._similarity_threshold = state.get(
                 "similarity_threshold",
                 self._config.default_similarity_threshold,
@@ -378,9 +372,10 @@ class DetectionCalibrator:
                 ))
 
             logger.info(
-                "Loaded calibration state: tier=%s, %d observations, "
-                "sim=%.3f, nov=%.3f",
-                self._tier.value,
+                "Loaded calibration state: sim_c=%.3f, nov_c=%.3f, "
+                "%d observations, sim=%.3f, nov=%.3f",
+                self.get_competence("similarity"),
+                self.get_competence("novelty"),
                 len(self._observations),
                 self._similarity_threshold,
                 self._novelty_threshold,

@@ -18,15 +18,19 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
-# [2026-05-25] Claude Code (Sonnet 4.6) — NEW-7: Remove dead novelty branch
-#   What: Removed dead `try: if self._eco: novelty = 0.5` block from _diagnose().
-#         Left `novelty = 1.0` as the functional default with explanatory comment.
-#   Why:  SKIP_ECOSYSTEM=True means _eco is always None — the if-branch never
-#         executed in production. The try/except was swallowing nothing. novelty=1.0
-#         (unknown failure = maximum novelty → lower confidence ceiling) is correct
-#         behavior for the current architecture. Real novelty from River substrate
-#         is a future improvement.
-#   How:  3-line deletion. No behavior change — novelty was already always 1.0.
+# [2026-05-25] Claude Code (Sonnet 4.6) — Wire live substrate novelty from River
+#   What: novelty now reads context.get("substrate_novelty", 1.0) instead of hardcoded 1.0.
+#         Hook passes EWMA of predictions_surprised/(confirmed+surprised) from NeuroGraph
+#         proper's ENTRY_TOPOLOGY BTF events. Bootstrap remains 1.0 (max caution).
+#   Why:  Hardcoded 1.0 treated every failure as permanently unknown, suppressing the
+#         confidence ceiling even for patterns the SNN has learned well. Low novelty
+#         earned through substrate predictive accuracy → higher ceiling → auto-execute.
+#         Same epistemic principle as competence graduation.
+#   How:  Hook._on_river_events() EWMA-updates _substrate_novelty. Both diagnose() call
+#         sites pass context={"substrate_novelty": self._substrate_novelty}.
+# [2026-05-25] Claude Code (Sonnet 4.6) — NEW-7: Remove dead `try: if self._eco: novelty = 0.5`
+#   What: Dead branch removed — _eco always None (SKIP_ECOSYSTEM=True). novelty=1.0 was
+#         already the only code path in production. try/except swallowed nothing.
 # [2026-02-27] Claude (Opus 4.6) — Phase 3+4 integration.
 #   What: Added Congregation deliberation in recommend zone and Tier 3
 #         repair broadcast after successful execution.
@@ -191,9 +195,11 @@ class DiagnosisEngine:
         self._dvs.add(failure_entry)
 
         # --- Step 2: Recognize ---
-        # novelty = 1.0: unknown failure, maximum novelty → lower confidence ceiling.
-        # Real novelty from River substrate is a future improvement (#NEW-7 audit).
-        novelty = 1.0
+        # Novelty from NeuroGraph proper's predictions_surprised/(confirmed+surprised) ratio,
+        # EWMA-smoothed and passed via context by the hook. Bootstraps at 1.0 (maximum
+        # caution) until River data flows. Low novelty = substrate knows this pattern well
+        # → higher confidence ceiling → engine may auto-execute familiar repairs.
+        novelty = context.get("substrate_novelty", 1.0)
 
         # Novelty-based confidence ceiling: new failures get lower max confidence
         n_thresh = self._config.diagnosis_novelty_threshold

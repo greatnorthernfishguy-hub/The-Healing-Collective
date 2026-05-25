@@ -24,6 +24,18 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — Wire substrate novelty from River (NeuroGraph proper)
+#   What: _on_river_events() now reads ENTRY_TOPOLOGY BTF events from NG proper's tract and
+#         extracts predictions_surprised/(confirmed+surprised) as the live novelty ratio.
+#         EWMA (α=0.2) smooths across step cycles. DiagnosisEngine receives substrate_novelty
+#         via context instead of hardcoded 1.0. Bootstraps at 1.0 (maximum caution) until
+#         NG proper's step data arrives.
+#   Why:  novelty=1.0 hardcoded treated every failure as completely unknown forever, suppressing
+#         the confidence ceiling even for patterns the SNN has learned well. The SNN decides
+#         novelty natively — predictions_surprised is the substrate's own measure of surprise.
+#         Same epistemic principle as competence graduation: earned trust, not granted.
+#   How:  _substrate_novelty float on hook, updated in _on_river_events() per BTF topology
+#         event. Both diagnose() call sites pass context={"substrate_novelty": self._substrate_novelty}.
 # [2026-04-19] Claude Code — #5: replace dead eco drain with _drain_river() + _on_river_events()
 #   What: _pulse_cycle() now calls _drain_river(); failure routing moved to _on_river_events() override
 #   Why: #5 — eco._peer_bridge was dead (SKIP_ECOSYSTEM); BTF drain is in openclaw_adapter base class
@@ -222,6 +234,9 @@ class HealingCollectiveHook(OpenClawAdapter):
         # Signal handlers for graceful shutdown
         self._register_shutdown_handlers()
 
+        # Substrate novelty from NeuroGraph proper's River (EWMA, bootstraps at 1.0)
+        self._substrate_novelty: float = 1.0
+
         # --- Pulse loop (#109) ---
         self._shutdown_event = threading.Event()
         self._in_conversation = False
@@ -325,6 +340,30 @@ class HealingCollectiveHook(OpenClawAdapter):
 
     def _on_river_events(self, events: list) -> None:
         """Route new River events through failure-detection bucket."""
+        # Extract substrate novelty from NeuroGraph proper's topology deposits
+        try:
+            import ng_tract
+            import msgpack
+            for entry in events:
+                if not hasattr(entry, "entry_type"):
+                    continue
+                if entry.entry_type != ng_tract.ENTRY_TOPOLOGY:
+                    continue
+                try:
+                    payload = msgpack.unpackb(entry.raw(), raw=False)
+                    confirmed = payload.get("predictions_confirmed", 0)
+                    surprised = payload.get("predictions_surprised", 0)
+                    total = confirmed + surprised
+                    if total > 0:
+                        step_novelty = surprised / total
+                        self._substrate_novelty = (
+                            0.8 * self._substrate_novelty + 0.2 * step_novelty
+                        )
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
         for event in events:
             if isinstance(event, dict) and event.get("conversation"):
                 try:
@@ -361,13 +400,8 @@ class HealingCollectiveHook(OpenClawAdapter):
         except Exception:
             pass
 
-        # Check substrate novelty
-        novelty = 0.0
-        try:
-            if self._eco:
-                novelty = 0.5  # novelty comes from delta now
-        except Exception:
-            pass
+        # Substrate novelty from NeuroGraph proper (EWMA updated in _on_river_events)
+        novelty = self._substrate_novelty
 
         # Get adaptive thresholds
         sim_threshold, nov_threshold = self._calibrator.get_thresholds()
@@ -389,6 +423,7 @@ class HealingCollectiveHook(OpenClawAdapter):
                     "detection_tier": self._calibrator.tier.value,
                 },
                 source="host",
+                context={"substrate_novelty": self._substrate_novelty},
             )
             was_real = (
                 diagnosis.proposed_primitive is not None
@@ -436,6 +471,7 @@ class HealingCollectiveHook(OpenClawAdapter):
             description=description,
             metadata=metadata,
             source="host",
+            context={"substrate_novelty": self._substrate_novelty},
         )
         return result.tracking_id
 

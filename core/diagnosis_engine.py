@@ -18,6 +18,15 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Sonnet 4.6) — NEW-7: Remove dead novelty branch
+#   What: Removed dead `try: if self._eco: novelty = 0.5` block from _diagnose().
+#         Left `novelty = 1.0` as the functional default with explanatory comment.
+#   Why:  SKIP_ECOSYSTEM=True means _eco is always None — the if-branch never
+#         executed in production. The try/except was swallowing nothing. novelty=1.0
+#         (unknown failure = maximum novelty → lower confidence ceiling) is correct
+#         behavior for the current architecture. Real novelty from River substrate
+#         is a future improvement.
+#   How:  3-line deletion. No behavior change — novelty was already always 1.0.
 # [2026-02-27] Claude (Opus 4.6) — Phase 3+4 integration.
 #   What: Added Congregation deliberation in recommend zone and Tier 3
 #         repair broadcast after successful execution.
@@ -182,12 +191,9 @@ class DiagnosisEngine:
         self._dvs.add(failure_entry)
 
         # --- Step 2: Recognize ---
+        # novelty = 1.0: unknown failure, maximum novelty → lower confidence ceiling.
+        # Real novelty from River substrate is a future improvement (#NEW-7 audit).
         novelty = 1.0
-        try:
-            if self._eco:
-                novelty = 0.5  # novelty from topology delta
-        except Exception:
-            pass
 
         # Novelty-based confidence ceiling: new failures get lower max confidence
         n_thresh = self._config.diagnosis_novelty_threshold

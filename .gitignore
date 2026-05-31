@@ -8,3 +8,6 @@ build/
 *.msgpack
 dvs_debug.json
 .env
+
+# understand-anything plugin working cache (scan/intermediate/tmp artifacts — regenerable)
+.understand-anything/

@@ -18,6 +18,14 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-06-22] Claude Code (Opus 4.8) — dual-pass deposit + fix doubled _eco guard
+#   What: Step-7 outcome recording now uses self._eco.dual_record_outcome(content=description, ...)
+#         instead of single-pass record_outcome — forest (failure description) + tree concepts
+#         (TID-extracted) land in the Commons. Also removed the doubled `if self._eco:` shrapnel.
+#   Why:  Josh's directive — NOTHING in the ecosystem is single-pass; forest+tree is the point.
+#         _eco is now the Commons-backed CommonsEco (#335), which gained dual_record_outcome.
+#   How:  description (the diagnose() failure text) is the forest content; embedding is the
+#         precomputed forest vector; CommonsEco fans both passes into the shared Commons.
 # [2026-05-25] Claude Code (Sonnet 4.6) — Wire live substrate novelty from River
 #   What: novelty now reads context.get("substrate_novelty", 1.0) instead of hardcoded 1.0.
 #         Hook passes EWMA of predictions_surprised/(confirmed+surprised) from NeuroGraph
@@ -327,8 +335,10 @@ class DiagnosisEngine:
 
                 try:
                     if self._eco:
-                        if self._eco: self._eco.record_outcome(
-                            embedding,
+                        # dual-pass: forest (failure description) + tree concepts → Commons.
+                        self._eco.dual_record_outcome(
+                            content=description,
+                            embedding=embedding,
                             target_id=f"repair:{proposed_primitive}",
                             success=success,
                             metadata={

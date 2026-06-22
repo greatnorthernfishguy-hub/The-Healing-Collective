@@ -24,6 +24,26 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-06-22] Claude Code (Opus 4.8) — Migrate THC onto THE COMMONS (substrate-as-protocol, #335)
+#   What: THC reconnected to the shared substrate three ways, mirroring QG #325:
+#         (1) DEPOSIT — DiagnosisEngine now gets a CommonsEco(namespaces=("repair:",)) instead of
+#             ng_ecosystem=None (SKIP_ECOSYSTEM dead-eco). Step-7 record_outcome deposits repair
+#             outcomes into the Commons (was a no-op — _eco was None).
+#         (2) BUCKET NOVELTY — _bucket_commons_novelty() reads NG's metrics:neurograph:* deposits
+#             from the Commons → _substrate_novelty (EWMA). Replaces the dead tract path: the
+#             NG→THC tract froze 0-byte on 2026-06-07 throttle, so _on_river_events' ENTRY_TOPOLOGY
+#             novelty has been a dead constant 1.0 for weeks.
+#         (3) BUCKET EXPERIENCE — _bucket_commons_experience() buckets NG's experience:* raw turns,
+#             embeds at THC's OWN boundary (self._embed, LAW 7), and runs _check_failure_from_river.
+#             This restores THC's conversation-triggered failure detection, which rode the same dead
+#             tract — THC has been DARK (never triggered except via host API). "Actually DO something."
+#   Why: Substrate axiom — THC dips its bucket into the shared Commons; nobody pushes to THC. The
+#         tract drain (_drain_river/_on_river_events) is the LAW-1 mechanism the Commons replaces.
+#   How: _pulse_cycle() calls the two buckets after the (now-empty) _drain_river(). Dedup via
+#         _commons_seen (metrics:/experience:/repair: prefixes don't collide). Fail-soft throughout —
+#         no Commons (standalone/Tier-1) → buckets no-op, CommonsEco→None. _on_river_events left intact
+#         (harmless: drains empty events). health_monitor/congregation/tier3 still ng_ecosystem=None —
+#         they reach into _eco._ng/_eco._peer_bridge private internals, a separate migration (FLAGGED).
 # [2026-05-25] Claude Code (Sonnet 4.6) — Wire substrate novelty from River (NeuroGraph proper)
 #   What: _on_river_events() now reads ENTRY_TOPOLOGY BTF events from NG proper's tract and
 #         extracts predictions_surprised/(confirmed+surprised) as the live novelty ratio.
@@ -114,6 +134,11 @@ import numpy as np
 
 from openclaw_adapter import OpenClawAdapter
 
+try:
+    from ng_commons_eco import CommonsEco   # vendored Commons-backed eco adapter (#335)
+except Exception:  # noqa: BLE001 — standalone/Tier-1 without the Commons toolkit on path
+    CommonsEco = None
+
 logger = logging.getLogger("healing_collective_hook")
 
 
@@ -173,7 +198,10 @@ class HealingCollectiveHook(OpenClawAdapter):
         self._engine = DiagnosisEngine(
             config=self._config,
             dvs=self._dvs,
-            ng_ecosystem=None,
+            # #335: Commons-backed eco (was None under SKIP_ECOSYSTEM). Step-7 record_outcome
+            # deposits repair outcomes to the shared Commons under the "repair:" namespace.
+            ng_ecosystem=(CommonsEco(namespaces=("repair:",), source_id="healing_collective")
+                          if CommonsEco else None),
             primitives=self._primitives,
             embed_fn=self._embed,
         )
@@ -236,6 +264,10 @@ class HealingCollectiveHook(OpenClawAdapter):
 
         # Substrate novelty from NeuroGraph proper's River (EWMA, bootstraps at 1.0)
         self._substrate_novelty: float = 1.0
+
+        # #335: dedup set for bucketed Commons deposits (metrics:/experience: prefixes don't collide).
+        # Novelty EWMA + failure detection must not re-process the same deposit across pulses.
+        self._commons_seen: set = set()
 
         # --- Pulse loop (#109) ---
         self._shutdown_event = threading.Event()
@@ -335,8 +367,96 @@ class HealingCollectiveHook(OpenClawAdapter):
 
     def _pulse_cycle(self) -> None:
         """Single pulse cycle — drain River tracts, check for failures, sync clusters."""
-        # Drain River tracts via BTF bridge (#5)
+        # Drain River tracts via BTF bridge (#5) — legacy path, empty since the 2026-06-07 throttle.
         self._drain_river()
+        # #335: the live Commons buckets — THC dips into the shared substrate (substrate axiom).
+        self._bucket_commons_novelty()       # NG substrate metrics → _substrate_novelty (EWMA)
+        self._bucket_commons_experience()    # NG raw conversation → failure detection (THC's trigger)
+
+    def _bucket_commons_novelty(self) -> None:
+        """Bucket NG's substrate metrics from the Commons → THC's novelty signal (#335).
+
+        Replaces the dead tract-drain novelty (_on_river_events ENTRY_TOPOLOGY), frozen since the
+        2026-06-07 throttle stopped NG depositing topology to THC's inbound tract. Same EWMA math,
+        now fed from the shared Commons. Substrate axiom — THC dips its bucket; nobody pushes.
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception:  # noqa: BLE001 — no Commons (standalone) → nothing to bucket
+            return
+        if commons is None:
+            return
+        try:
+            recs = commons.bucket_recent(limit=50, with_metadata=True)
+        except Exception as exc:  # noqa: BLE001 — a bucket failure never breaks the pulse
+            logger.debug("THC Commons novelty bucket failed: %s", exc)
+            return
+        for target_id, _w, _r, meta in recs:
+            if not target_id.startswith("metrics:neurograph:") or target_id in self._commons_seen:
+                continue
+            self._commons_seen.add(target_id)
+            surprise = self._surprise_from_metric(meta)
+            if surprise is not None:
+                self._substrate_novelty = (
+                    0.8 * self._substrate_novelty + 0.2 * surprise
+                )
+        if len(self._commons_seen) > 4096:           # bound the dedup set
+            self._commons_seen = set(list(self._commons_seen)[-2048:])
+
+    def _bucket_commons_experience(self) -> None:
+        """Bucket NG's raw conversation experience from the Commons → THC failure detection (#335).
+
+        THC's conversation-triggered failure detection rode the dead tract too (THC has been DARK,
+        triggered only via the host report_failure API). Restore it: bucket experience:* raw turns,
+        embed at THC's OWN extraction boundary (self._embed, LAW 7 — classify/embed at the bucket),
+        run _check_failure_from_river. Dedup via _commons_seen. Fail-soft.
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception:  # noqa: BLE001 — no Commons (standalone) → nothing to bucket
+            return
+        if commons is None:
+            return
+        try:
+            recs = commons.bucket_recent(limit=50, with_metadata=True)
+        except Exception as exc:  # noqa: BLE001 — a bucket failure never breaks the pulse
+            logger.debug("THC Commons experience bucket failed: %s", exc)
+            return
+        for target_id, _w, _r, meta in recs:
+            if not target_id.startswith("experience:") or target_id in self._commons_seen:
+                continue
+            self._commons_seen.add(target_id)
+            if not isinstance(meta, dict):
+                continue
+            text = "\n\n".join(p for p in (meta.get("user_text"), meta.get("assistant_text")) if p)
+            if not text:
+                continue
+            try:
+                emb = self._embed(text)          # THC embeds at its OWN boundary (LAW 7)
+                if emb is None:
+                    continue
+                self._check_failure_from_river({"text": text, "embedding": emb})
+            except Exception as exc:  # noqa: BLE001 — one bad turn never breaks the pulse
+                logger.debug("THC failure-check from Commons experience failed: %s", exc)
+        if len(self._commons_seen) > 4096:
+            self._commons_seen = set(list(self._commons_seen)[-2048:])
+
+    @staticmethod
+    def _surprise_from_metric(meta) -> "Optional[float]":
+        """Extract NG's surprise ratio from a bucketed metric deposit (anomaly or nominal span)."""
+        if not isinstance(meta, dict):
+            return None
+        if meta.get("salience") == "anomaly" and "signal" in meta:
+            return float(meta["signal"])            # the surprise ratio, directly
+        agg = meta.get("aggregate") if meta.get("salience") == "nominal" else None
+        if isinstance(agg, dict):
+            c = agg.get("predictions_confirmed", 0)
+            s = agg.get("predictions_surprised", 0)
+            t = c + s
+            return (s / t) if t else 0.0            # nominal span ⇒ low/zero surprise (still informative)
+        return None
 
     def _on_river_events(self, events: list) -> None:
         """Route new River events through failure-detection bucket."""

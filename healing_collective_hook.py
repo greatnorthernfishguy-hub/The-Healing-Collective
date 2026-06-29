@@ -24,6 +24,19 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-06-29] Claude Code (Sonnet 4.6) — Complete #335: repair: bucket + retire JSONL double-write
+#   What: (4) BUCKET REPAIR — _bucket_commons_repair() reads peer repair:* deposits from the Commons
+#         and imports them into the local DVS as REPAIR_RECORD entries. This replaces
+#         Tier3Coordinator.sync_cluster_knowledge() (JSONL file reads) and the startup
+#         sync_cluster_knowledge() call. DiagnosisEngine no longer calls broadcast_repair()
+#         (JSONL write) — CommonsEco.dual_record_outcome() is the substrate-native broadcast.
+#   Why:  JSONL shared_learning/*.jsonl files were filesystem-based direct inter-module data
+#         transport — LAW 1 violation even if async. _bucket_commons_repair() on every pulse
+#         is the substrate-native replacement: THC dips its bucket, nobody fans out to it.
+#   How:  Removed sync_cluster_knowledge() from _on_river_events() (line ~496) and startup
+#         (line ~247). Added _bucket_commons_repair() to _pulse_cycle(). CommonsEco metadata
+#         now carries confidence + embedding + module_id so DVS entries can be reconstructed.
+#         Dedup via _commons_seen (repair: prefix doesn't collide with metrics:/experience:).
 # [2026-06-22] Claude Code (Opus 4.8) — Migrate THC onto THE COMMONS (substrate-as-protocol, #335)
 #   What: THC reconnected to the shared substrate three ways, mirroring QG #325:
 #         (1) DEPOSIT — DiagnosisEngine now gets a CommonsEco(namespaces=("repair:",)) instead of
@@ -242,11 +255,8 @@ class HealingCollectiveHook(OpenClawAdapter):
         )
         self._engine._tier3 = self._tier3
 
-        # Startup: sync cluster knowledge (Tier 3)
-        try:
-            self._tier3.sync_cluster_knowledge()
-        except Exception:
-            pass
+        # Startup: cluster repair knowledge now arrives via _bucket_commons_repair() on every
+        # pulse — no JSONL startup sync needed (#335 JSONL retired).
 
         # Start Health Monitor background thread
         self._health_monitor.start()
@@ -372,6 +382,7 @@ class HealingCollectiveHook(OpenClawAdapter):
         # #335: the live Commons buckets — THC dips into the shared substrate (substrate axiom).
         self._bucket_commons_novelty()       # NG substrate metrics → _substrate_novelty (EWMA)
         self._bucket_commons_experience()    # NG raw conversation → failure detection (THC's trigger)
+        self._bucket_commons_repair()        # peer repair:* deposits → local DVS (replaces JSONL sync)
 
     def _bucket_commons_novelty(self) -> None:
         """Bucket NG's substrate metrics from the Commons → THC's novelty signal (#335).
@@ -443,6 +454,66 @@ class HealingCollectiveHook(OpenClawAdapter):
         if len(self._commons_seen) > 4096:
             self._commons_seen = set(list(self._commons_seen)[-2048:])
 
+    def _bucket_commons_repair(self) -> None:
+        """Bucket peer repair:* deposits from the Commons → local DVS (#335).
+
+        Replaces Tier3Coordinator.sync_cluster_knowledge() JSONL file reads. Other modules
+        depositing to repair:* via CommonsEco become visible here — substrate-native cluster
+        repair knowledge sharing. Own module deposits (module_id == MODULE_ID) are skipped
+        (already in DVS from step-7). Dedup via _commons_seen. Fail-soft throughout.
+
+        DVS entries use source="tier3_sync" so get_cluster_confidence() picks them up
+        without any changes to that method's existing filter logic.
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception:  # noqa: BLE001 — no Commons (standalone/Tier-1) → nothing to bucket
+            return
+        if commons is None:
+            return
+        try:
+            recs = commons.bucket_recent(limit=50, with_metadata=True)
+        except Exception as exc:  # noqa: BLE001 — a bucket failure never breaks the pulse
+            logger.debug("THC Commons repair bucket failed: %s", exc)
+            return
+        from core.dvs import DVSEntry, DVSEntryType
+        for target_id, _w, _r, meta in recs:
+            if not target_id.startswith("repair:") or target_id in self._commons_seen:
+                continue
+            self._commons_seen.add(target_id)
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("module_id") == self.MODULE_ID:
+                continue  # Own deposits already in DVS from step-7
+            embedding_raw = meta.get("embedding")
+            if not embedding_raw:
+                continue
+            try:
+                entry = DVSEntry.create(
+                    entry_type=DVSEntryType.REPAIR_RECORD,
+                    source_module=meta.get("module_id", "unknown_peer"),
+                    embedding=np.asarray(embedding_raw, dtype=np.float32),
+                    content={
+                        "proposed_primitive": target_id.split("repair:", 1)[-1],
+                        "failure_description": meta.get("failure_description", ""),
+                        "tracking_id": meta.get("tracking_id", ""),
+                        "source": "tier3_sync",  # get_cluster_confidence() filters on this key
+                        "original_module": meta.get("module_id"),
+                    },
+                    confidence=meta.get("confidence", 0.5),
+                    repair_outcome=meta.get("status", "unknown"),
+                )
+                self._dvs.add(entry)
+                logger.debug(
+                    "THC repair DVS import from Commons: %s (%s)",
+                    target_id, meta.get("module_id", "?"),
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad entry never breaks the pulse
+                logger.debug("THC repair DVS import failed: %s", exc)
+        if len(self._commons_seen) > 4096:
+            self._commons_seen = set(list(self._commons_seen)[-2048:])
+
     @staticmethod
     def _surprise_from_metric(meta) -> "Optional[float]":
         """Extract NG's surprise ratio from a bucketed metric deposit (anomaly or nominal span)."""
@@ -491,11 +562,7 @@ class HealingCollectiveHook(OpenClawAdapter):
                 except Exception as exc:
                     logger.debug("Pulse failure check error: %s", exc)
 
-        # Sync cluster knowledge from tier3 coordinator
-        try:
-            self._tier3.sync_cluster_knowledge()
-        except Exception as exc:
-            logger.debug("Pulse tier3 sync failed: %s", exc)
+        # Cluster repair sync moved to _bucket_commons_repair() in _pulse_cycle() (#335).
 
     def _check_failure_from_river(self, conversation: dict) -> None:
         """Check conversation content from River for failure signals.

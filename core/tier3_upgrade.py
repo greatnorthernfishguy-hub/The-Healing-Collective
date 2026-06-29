@@ -14,6 +14,15 @@ relevant ones into the local DVS — giving the Collective the benefit
 of the entire cluster's repair experience.
 
 # ---- Changelog ----
+# [2026-06-29] Claude Code (Sonnet 4.6) — Retire JSONL inter-module transport (#335)
+#   What: broadcast_repair() and sync_cluster_knowledge() are now no-ops. Their JSONL file
+#         read/write operations are removed. Counter increments (self._broadcasts, self._syncs)
+#         are kept so stats() remains meaningful. Methods retained for API compat.
+#   Why:  JSONL files in shared_learning/ were filesystem-based direct inter-module data sharing —
+#         LAW 1 violation even though async. CommonsEco deposit in DiagnosisEngine step-7 is the
+#         substrate-native broadcast. HealingCollectiveHook._bucket_commons_repair() is the
+#         substrate-native sync. The two together replace both methods completely.
+#   How:  Gutted the file-I/O body from each method. SyncResult with zeros returned by sync.
 # [2026-03-23] Claude Code (Opus 4.6) — Fix _shared_dir AttributeError (#101)
 # What: Guard _peer_bridge._shared_dir access with hasattr check.
 # Why:  NGTractBridge (v0.3+) replaced NGPeerBridge but doesn't have
@@ -152,99 +161,33 @@ class Tier3Coordinator:
         outcome: str,
         tracking_id: str = "",
     ) -> None:
-        """Broadcast a repair outcome to the cluster.
+        """No-op — repair outcomes now deposit to the Commons via CommonsEco (#335).
 
-        Writes the outcome to the shared learning directory so other
-        modules can benefit from this module's experience.
-
-        Args:
-            failure_description: What failed.
-            embedding: Failure embedding vector.
-            proposed_primitive: Which repair was applied.
-            confidence: Confidence at time of repair.
-            outcome: "success", "partial", or "failed".
-            tracking_id: Optional tracking ID.
+        DiagnosisEngine step-7 CommonsEco.dual_record_outcome() is the substrate-native
+        broadcast. The JSONL double-write this method performed is retired. Method retained
+        for API compat; counter still increments for stats().
         """
-        record = {
-            "module_id": self._module_id,
-            "timestamp": time.time(),
-            "failure_description": failure_description,
-            "embedding": embedding.tolist() if isinstance(embedding, np.ndarray) else list(embedding),
-            "proposed_primitive": proposed_primitive,
-            "confidence": confidence,
-            "outcome": outcome,
-            "tracking_id": tracking_id,
-        }
-
-        try:
-            with open(self._broadcast_file, "a") as f:
-                f.write(json.dumps(record, default=str) + "\n")
-                f.flush()
-            self._broadcasts += 1
-            logger.debug(
-                "Broadcast repair: %s -> %s (%s)",
-                proposed_primitive, outcome, failure_description[:50],
-            )
-        except OSError as exc:
-            logger.warning("Failed to broadcast repair: %s", exc)
+        self._broadcasts += 1
+        logger.debug(
+            "broadcast_repair: now via CommonsEco (JSONL retired #335): %s -> %s",
+            proposed_primitive, outcome,
+        )
 
     # -----------------------------------------------------------------
     # Sync
     # -----------------------------------------------------------------
 
     def sync_cluster_knowledge(self) -> SyncResult:
-        """Download and merge repair knowledge from all peers.
+        """No-op — cluster repair knowledge now buckets from the Commons (#335).
 
-        Reads peer modules' repair broadcast files and imports
-        relevant records into the local DVS.  Records are imported
-        as REPAIR_RECORD entries with the peer's module_id as source.
-
-        Returns:
-            SyncResult with import statistics.
+        HealingCollectiveHook._bucket_commons_repair() reads repair:* deposits from
+        the Commons on every pulse and imports them into the DVS. The JSONL file reads
+        this method performed are retired. Method retained for API compat; counter
+        still increments for stats().
         """
-        start = time.monotonic()
         self._syncs += 1
-
-        peers_read = 0
-        records_imported = 0
-        records_skipped = 0
-
-        try:
-            for repair_file in self._shared_dir.glob("*_repairs.jsonl"):
-                peer_module = repair_file.stem.replace("_repairs", "")
-                if peer_module == self._module_id:
-                    continue  # Skip own file
-
-                new_records = self._read_peer_repairs(repair_file, peer_module)
-                peers_read += 1
-
-                for record in new_records:
-                    imported = self._import_repair_record(record)
-                    if imported:
-                        records_imported += 1
-                    else:
-                        records_skipped += 1
-
-        except Exception as exc:
-            logger.warning("Cluster sync failed: %s", exc)
-
-        self._total_imported += records_imported
-        elapsed_ms = (time.monotonic() - start) * 1000
-
-        result = SyncResult(
-            peers_read=peers_read,
-            records_imported=records_imported,
-            records_skipped=records_skipped,
-            duration_ms=elapsed_ms,
-        )
-
-        if records_imported > 0:
-            logger.info(
-                "Cluster sync: %d peers, %d imported, %d skipped (%.0fms)",
-                peers_read, records_imported, records_skipped, elapsed_ms,
-            )
-
-        return result
+        logger.debug("sync_cluster_knowledge: now via Commons bucket (JSONL retired #335)")
+        return SyncResult(peers_read=0, records_imported=0, records_skipped=0, duration_ms=0.0)
 
     def _read_peer_repairs(
         self,

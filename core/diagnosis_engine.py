@@ -18,6 +18,17 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-06-29] Claude Code (Sonnet 4.6) — Remove broadcast_repair() JSONL double-write (#335)
+#   What: Step-7 no longer calls self._tier3.broadcast_repair() after CommonsEco.dual_record_outcome().
+#         CommonsEco IS the substrate-native broadcast — the JSONL write was a double-write and a
+#         LAW 1 violation (filesystem-based inter-module data sharing). CommonsEco metadata now
+#         includes confidence, module_id, failure_description (truncated), and embedding so that
+#         HealingCollectiveHook._bucket_commons_repair() can reconstruct peer DVS entries.
+#   Why:  broadcast_repair() wrote to {module_id}_repairs.jsonl in the shared_learning dir. Peers
+#         read each other's files in sync_cluster_knowledge(). That is filesystem-based direct
+#         inter-module data flow — LAW 1 semantically even if async. CommonsEco deposit +
+#         _bucket_commons_repair() is the substrate-native replacement.
+#   How:  Removed the tier3.broadcast_repair() call block. Enriched dual_record_outcome metadata.
 # [2026-06-22] Claude Code (Opus 4.8) — dual-pass deposit + fix doubled _eco guard
 #   What: Step-7 outcome recording now uses self._eco.dual_record_outcome(content=description, ...)
 #         instead of single-pass record_outcome — forest (failure description) + tree concepts
@@ -336,6 +347,8 @@ class DiagnosisEngine:
                 try:
                     if self._eco:
                         # dual-pass: forest (failure description) + tree concepts → Commons.
+                        # Metadata carries confidence + embedding so _bucket_commons_repair() can
+                        # reconstruct peer DVS entries from these deposits (#335, replaces JSONL).
                         self._eco.dual_record_outcome(
                             content=description,
                             embedding=embedding,
@@ -344,6 +357,14 @@ class DiagnosisEngine:
                             metadata={
                                 "tracking_id": tracking_id,
                                 "status": execution.status,
+                                "confidence": confidence,
+                                "module_id": "healing_collective",
+                                "failure_description": description[:200],
+                                "embedding": (
+                                    embedding.tolist()
+                                    if isinstance(embedding, np.ndarray)
+                                    else list(embedding)
+                                ),
                             },
                         )
                 except Exception:
@@ -354,20 +375,6 @@ class DiagnosisEngine:
                 self._cooldowns[cooldown_key] = (
                     time.time() + self._config.repair_cooldown_seconds
                 )
-
-                # Phase 4: Tier 3 broadcast — share repair outcome with cluster
-                if self._tier3 is not None:
-                    try:
-                        self._tier3.broadcast_repair(
-                            failure_description=description,
-                            embedding=embedding,
-                            proposed_primitive=proposed_primitive,
-                            confidence=confidence,
-                            outcome=execution.status,
-                            tracking_id=tracking_id,
-                        )
-                    except Exception:
-                        pass
 
                 logger.info(
                     "[%s] Executed %s: %s (%s)",

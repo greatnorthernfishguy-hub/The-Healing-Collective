@@ -10,7 +10,7 @@
 For full ecosystem context, read these from the Obsidian vault (`~/docs/`):
 - **Module page:** `~/docs/modules/THC.md`
 - **Concepts:** `~/docs/concepts/The Triad.md`, `~/docs/concepts/Competence Model.md`, `~/docs/concepts/Vendored Files.md`
-- **Systems:** `~/docs/systems/NG-Lite.md`, `~/docs/systems/NG Peer Bridge.md`, `~/docs/systems/Dual-Pass Embedding.md`
+- **Systems:** `~/docs/systems/NG-Lite.md`, `~/docs/systems/NG Tract Bridge.md`, `~/docs/systems/Dual-Pass Embedding.md`
 - **Audits:** `~/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`, `~/docs/audits/ecosystem-static-value-audit-2026-03-23.md`
 
 Each vault page has a Context Map at the top linking to related docs. Follow those links for ripple effects and dependencies.
@@ -52,10 +52,10 @@ They do not coordinate directly. The River flows. The topology reshapes itself.
 │   ├── compression.py             # Phase 4: DVS pattern compression
 │   └── tier3_upgrade.py           # Phase 4: Tier 3 cluster coordination
 ├── ng_lite.py                     # VENDORED — canonical from NeuroGraph
-├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph (legacy, retained until v1.0)
-├── ng_tract_bridge.py             # VENDORED — canonical from NeuroGraph (v0.3+, preferred)
+├── ng_tract_bridge.py             # VENDORED — canonical from NeuroGraph (v0.3+, per-pair directional tracts)
 ├── ng_ecosystem.py                # VENDORED — canonical from NeuroGraph
 ├── ng_autonomic.py                # VENDORED — canonical from NeuroGraph (THC: no read/write)
+├── ng_embed.py                    # VENDORED — canonical from NeuroGraph (Snowflake 768-dim, ONNX)
 ├── openclaw_adapter.py            # VENDORED — canonical from NeuroGraph
 ├── ng_updater.py                  # VENDORED — auto-update + vendored file sync (runs on startup)
 ├── et_modules/                    # ET Module Manager integration
@@ -206,12 +206,14 @@ Seven vendored files synced to NeuroGraph canonical:
 | File | Purpose | Last Synced |
 |------|---------|-------------|
 | `ng_lite.py` | Tier 1 learning substrate | 2026-03-20 |
-| `ng_peer_bridge.py` | Tier 2 legacy fallback (JSONL-based) | 2026-03-18 |
-| `ng_tract_bridge.py` | Tier 2 preferred (per-pair directional tracts, v0.3+) | 2026-03-20 |
+| `ng_tract_bridge.py` | Tier 2 peer bridge (per-pair directional tracts, v0.3+) | 2026-03-20 |
 | `ng_ecosystem.py` | Tier management lifecycle | 2026-03-18 |
 | `ng_autonomic.py` | Autonomic state (THC: no read/write currently) | 2026-03-18 |
+| `ng_embed.py` | Centralized embedding (Snowflake 768-dim, ONNX Runtime) | 2026-06-29 |
 | `openclaw_adapter.py` | OpenClaw skill base class | 2026-02-22 |
 | `ng_updater.py` | Auto-update + vendored file sync (runs on startup before imports) | 2026-03-20 |
+
+**Removed 2026-06-03:** `ng_peer_bridge.py` — deleted from canonical (legacy JSONL bridge). NGTractBridge is the sole peer bridge. Do NOT re-add.
 
 ### The validate() → execute() Contract
 
@@ -286,6 +288,6 @@ THC originally used 5 hardcoded regex patterns to detect failures — pre-classi
 ---
 
 *E-T Systems / The Healing Collective*
-*Last updated: 2026-03-21*
+*Last updated: 2026-06-29*
 *Maintained by Josh — do not edit without authorization*
 *Parent documents: `~/.claude/CLAUDE.md` (global), `~/.claude/ARCHITECTURE.md`*

@@ -24,6 +24,16 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-06-30] Claude Code (Sonnet 4.6) — Close #327: strip dead loops from _on_river_events()
+#   What: Removed the two dead loops in _on_river_events(): (a) ENTRY_TOPOLOGY loop calling
+#         entry.raw() — PyTopologyEntry has no .raw() API and the NG→THC tract has been
+#         throttled/frozen since 2026-06-07 anyway; (b) event["conversation"] dict-routing loop
+#         — no NG code ever emitted that dict format post-BTF. The punchlist-#327 novelty and
+#         experience paths are both live in _bucket_commons_novelty() / _bucket_commons_experience()
+#         (implemented 2026-06-22). _on_river_events() is now a documented no-op override.
+#   Why:  LAW 3 — dead code in a called method is live shrapnel; correct field reads no longer
+#         needed once the live replacement (Commons bucket) is confirmed working (8/8 tests green).
+#   How:  Stripped the two for-loops; left the docstring + the #335 cluster-sync note in place.
 # [2026-06-29] Claude Code (Sonnet 4.6) — Complete #335: repair: bucket + retire JSONL double-write
 #   What: (4) BUCKET REPAIR — _bucket_commons_repair() reads peer repair:* deposits from the Commons
 #         and imports them into the local DVS as REPAIR_RECORD entries. This replaces
@@ -530,39 +540,16 @@ class HealingCollectiveHook(OpenClawAdapter):
         return None
 
     def _on_river_events(self, events: list) -> None:
-        """Route new River events through failure-detection bucket."""
-        # Extract substrate novelty from NeuroGraph proper's topology deposits
-        try:
-            import ng_tract
-            import msgpack
-            for entry in events:
-                if not hasattr(entry, "entry_type"):
-                    continue
-                if entry.entry_type != ng_tract.ENTRY_TOPOLOGY:
-                    continue
-                try:
-                    payload = msgpack.unpackb(entry.raw(), raw=False)
-                    confirmed = payload.get("predictions_confirmed", 0)
-                    surprised = payload.get("predictions_surprised", 0)
-                    total = confirmed + surprised
-                    if total > 0:
-                        step_novelty = surprised / total
-                        self._substrate_novelty = (
-                            0.8 * self._substrate_novelty + 0.2 * step_novelty
-                        )
-                except Exception:
-                    pass
-        except ImportError:
-            pass
+        """No-op override — live paths moved to Commons buckets (#327, #335).
 
-        for event in events:
-            if isinstance(event, dict) and event.get("conversation"):
-                try:
-                    self._check_failure_from_river(event["conversation"])
-                except Exception as exc:
-                    logger.debug("Pulse failure check error: %s", exc)
-
-        # Cluster repair sync moved to _bucket_commons_repair() in _pulse_cycle() (#335).
+        The NG→THC inbound tract has been throttled since 2026-06-07 (substrate-as-protocol
+        restoration), so events is always []. Both live paths were migrated 2026-06-22:
+          - Novelty: _bucket_commons_novelty() (NG metrics:neurograph:* → _substrate_novelty EWMA)
+          - Failure detection: _bucket_commons_experience() (NG experience:* → _check_failure_from_river)
+          - Cluster repair sync: _bucket_commons_repair() (#335)
+        Both were also broken here: entry.raw() doesn't exist on PyTopologyEntry; event["conversation"]
+        dict format was never emitted by any NG code post-BTF. Dead loops removed 2026-06-30 (#327).
+        """
 
     def _check_failure_from_river(self, conversation: dict) -> None:
         """Check conversation content from River for failure signals.

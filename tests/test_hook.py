@@ -221,57 +221,86 @@ class TestRegisterPrimitive:
 
 
 class TestMessageScanning:
+    """Exercises _check_failure_from_river() — the LIVE detection trigger since the #335
+    Commons migration (2026-06-22). _module_on_message() itself is a documented no-op
+    (message scanning now runs from _bucket_commons_experience() in the pulse cycle) —
+    these tests used to assert on that dead API and on hook_instance._eco, which is
+    intentionally None under SKIP_ECOSYSTEM. Rewritten 2026-07-05 (#347) to target the
+    real trigger path: hook_instance._substrate_novelty (EWMA field, not a mocked
+    ecosystem method) and hook_instance._check_failure_from_river({"text", "embedding"}).
+    """
+
     def test_dvs_similarity_triggers_detection(self, hook_instance):
-        """When DVS contains a similar failure signature, detection fires."""
-        # Pre-seed DVS with a failure signature via report_failure
+        """When DVS contains a similar failure signature, detection fires via similarity."""
+        hook_instance._substrate_novelty = 0.3  # below threshold — isolate the similarity path
         hook_instance.report_failure("Connection refused on port 5432")
 
-        # Now send a similar message — DVS should find the seeded signature
-        failure_embedding = _hash_embed("Connection refused on port 5432")
-        result = hook_instance._module_on_message(
-            "Connection refused on port 5432",
-            failure_embedding,
-        )
-        # Same embedding should have high DVS similarity to the seeded entry
-        assert result["dvs_similarity"] > 0
-        assert "trigger" in result
-        assert "novelty" in result
+        # Use the hook's REAL embed function (ng_embed semantic model, not the test's
+        # hash-based _hash_embed helper) — report_failure() embedded the seed with it, so
+        # the query must match or DVS similarity is comparing two unrelated vector spaces.
+        failure_embedding = hook_instance._embed("Connection refused on port 5432")
+        with mock.patch.object(
+            hook_instance._engine, "diagnose", wraps=hook_instance._engine.diagnose,
+        ) as spy:
+            hook_instance._check_failure_from_river({
+                "text": "Connection refused on port 5432",
+                "embedding": failure_embedding,
+            })
+        assert spy.called, "similarity to the seeded failure signature should trigger diagnose()"
+        _, kwargs = spy.call_args
+        assert kwargs["metadata"]["trigger"] == "dvs_similarity"
+        assert kwargs["metadata"]["dvs_similarity"] > 0
 
     def test_novelty_triggers_detection(self, hook_instance):
-        """When substrate reports high novelty, detection fires."""
-        # Mock ecosystem to return very high novelty
-        hook_instance._eco.detect_novelty = lambda emb: 0.95
+        """When substrate reports high novelty, detection fires via novelty."""
+        hook_instance._substrate_novelty = 0.95  # above the 0.85 apprentice default
 
-        result = hook_instance._module_on_message(
-            "Something completely unprecedented happened",
-            _hash_embed("Something completely unprecedented happened"),
-        )
-        assert result["failure_detected"] is True
-        assert result["trigger"] == "novelty"
-        assert result["novelty"] >= 0.85
-        assert "diagnosis" in result
+        with mock.patch.object(
+            hook_instance._engine, "diagnose", wraps=hook_instance._engine.diagnose,
+        ) as spy:
+            hook_instance._check_failure_from_river({
+                "text": "Something completely unprecedented happened",
+                "embedding": _hash_embed("Something completely unprecedented happened"),
+            })
+        assert spy.called, "high novelty should trigger diagnose() even with no DVS match"
+        _, kwargs = spy.call_args
+        assert kwargs["metadata"]["trigger"] == "novelty"
+        assert kwargs["metadata"]["novelty"] >= 0.85
 
     def test_clean_message_no_detection(self, hook_instance):
-        """Normal messages with no DVS match and low novelty pass through."""
-        # Default mock ecosystem returns novelty=0.5, below threshold
-        result = hook_instance._module_on_message(
-            "The weather is nice today",
-            _hash_embed("The weather is nice today"),
-        )
-        assert result["failure_detected"] is False
-        assert result["trigger"] == "none"
+        """Normal messages with no DVS match and low novelty do not trigger diagnosis."""
+        hook_instance._substrate_novelty = 0.3  # below the 0.85 apprentice default
+
+        with mock.patch.object(
+            hook_instance._engine, "diagnose", wraps=hook_instance._engine.diagnose,
+        ) as spy:
+            hook_instance._check_failure_from_river({
+                "text": "The weather is nice today",
+                "embedding": _hash_embed("The weather is nice today"),
+            })
+        assert not spy.called, "low similarity + low novelty must not trigger diagnose()"
 
     def test_result_metadata_fields(self, hook_instance):
-        """Substrate detection results include observability metadata."""
-        result = hook_instance._module_on_message(
-            "Routine status check",
-            _hash_embed("Routine status check"),
-        )
-        assert "dvs_similarity" in result
-        assert "novelty" in result
-        assert "trigger" in result
-        assert isinstance(result["dvs_similarity"], float)
-        assert isinstance(result["novelty"], float)
+        """Triggered detections pass observability metadata (dvs_similarity, novelty, trigger,
+        detection_tier) into diagnose() — the fields the calibrator/DVS rely on downstream."""
+        hook_instance._substrate_novelty = 0.95
+
+        with mock.patch.object(
+            hook_instance._engine, "diagnose", wraps=hook_instance._engine.diagnose,
+        ) as spy:
+            hook_instance._check_failure_from_river({
+                "text": "Routine status check",
+                "embedding": _hash_embed("Routine status check"),
+            })
+        assert spy.called
+        _, kwargs = spy.call_args
+        meta = kwargs["metadata"]
+        assert "dvs_similarity" in meta
+        assert "novelty" in meta
+        assert "trigger" in meta
+        assert "detection_tier" in meta
+        assert isinstance(meta["dvs_similarity"], float)
+        assert isinstance(meta["novelty"], float)
 
     def test_no_regex_dependency(self):
         """Verify the hook module does not import re (Law 7 compliance)."""

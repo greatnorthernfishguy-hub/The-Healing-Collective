@@ -24,6 +24,23 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — NEW #353: fix .tier.value AttributeError (long-standing)
+#   What: _check_failure_from_river()'s diagnose() call built its metadata dict with
+#         self._calibrator.tier.value — but DetectionCalibrator.tier is a @property that
+#         already returns a plain str ("apprentice"/"journeyman"/"master"), not an enum.
+#         Every call raised AttributeError while evaluating the metadata dict, BEFORE
+#         self._engine.diagnose() was ever invoked — silently swallowed by the surrounding
+#         try/except (logger.debug only). Fixed: read self._calibrator.tier directly.
+#   Why:  Discovered while rewriting #348's TestMessageScanning tests to exercise the real
+#         _check_failure_from_river() method (the old tests only exercised the now-dead
+#         _module_on_message() no-op; test_commons_migration.py's 8 tests stub out
+#         _check_failure_from_river entirely). Git blame: this line predates even the #5
+#         introduction of _check_failure_from_river (2026-04-19) — it has been broken since
+#         THC's detection code was first built (d611d02). No test ever reached the real
+#         method body until this session's rewrite, so it survived every migration,
+#         including this session's own #327 closure. THC's conversation-triggered failure
+#         detection has silently never completed a diagnose() call, ever.
+#   How:  One-line fix: `self._calibrator.tier.value` -> `self._calibrator.tier`.
 # [2026-06-30] Claude Code (Sonnet 4.6) — Close #327: strip dead loops from _on_river_events()
 #   What: Removed the two dead loops in _on_river_events(): (a) ENTRY_TOPOLOGY loop calling
 #         entry.raw() — PyTopologyEntry has no .raw() API and the NG→THC tract has been
@@ -594,7 +611,7 @@ class HealingCollectiveHook(OpenClawAdapter):
                     "dvs_similarity": dvs_similarity,
                     "novelty": novelty,
                     "trigger": trigger,
-                    "detection_tier": self._calibrator.tier.value,
+                    "detection_tier": self._calibrator.tier,
                 },
                 source="host",
                 context={"substrate_novelty": self._substrate_novelty},

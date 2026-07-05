@@ -2,6 +2,21 @@
 Tests for core/health_monitor.py — Background health monitoring.
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — #348 investigation surfaced NEW #354 regression
+# What: test_extreme_weights_triggers_issue and test_mostly_dead_nodes marked xfail(strict=True).
+#       _check_weight_divergence() and _check_firing_rates() are BOTH stubbed to unconditionally
+#       `return None` ("synapse/node health from topology delta") — a real, silent regression,
+#       not test staleness. Same failure shape as #326/#327: a check orphaned during a migration
+#       (health_monitor is constructed with ng_ecosystem=None in production; these checks used
+#       to read self._eco._ng.synapses/.nodes directly, which no longer works) and never
+#       reconnected. NOT fixed here — deliberately left failing (via xfail, not deletion or a
+#       rewritten assertion) so the suite stays honest about the gap. strict=True means an
+#       unexpected PASS fails the suite too, forcing the marker's removal once #354 is fixed.
+# Why: Per the ecosystem's standing rule, problems found outside the current task get flagged,
+#      not silently patched or hidden. Rewriting these tests to expect 0 issues would cement a
+#      health-check blindness identical in shape to two bugs already found and fixed this week.
+#      (These 2 tests were part of punchlist #348 "THC stale tests" — that item's original
+#      assessment called all 6 pure staleness; these 2 turned out to mask a real regression.)
 # [2026-02-27] Claude (Opus 4.6) — Initial creation.
 # -------------------
 """
@@ -104,6 +119,12 @@ class TestHealthCheckWeightDivergence:
         issues = [i for i in report.issues if i.category == "weight_divergence"]
         assert len(issues) == 0
 
+    @pytest.mark.xfail(
+        reason="#354: _check_weight_divergence() is stubbed to `return None` unconditionally "
+                "(orphaned during the ng_ecosystem=None migration, never reconnected to the "
+                "Commons) — a real regression, not test staleness. See test file changelog.",
+        strict=True,
+    )
     def test_extreme_weights_triggers_issue(self):
         """Synapses with extreme divergence should trigger an issue."""
         synapses = {
@@ -138,6 +159,12 @@ class TestHealthCheckFiringRates:
         rate_issues = [i for i in report.issues if i.category == "low_firing_rate"]
         assert len(rate_issues) == 0
 
+    @pytest.mark.xfail(
+        reason="#354: _check_firing_rates() is stubbed to `return None` unconditionally "
+                "(orphaned during the ng_ecosystem=None migration, never reconnected to the "
+                "Commons) — a real regression, not test staleness. See test file changelog.",
+        strict=True,
+    )
     def test_mostly_dead_nodes(self):
         """Majority dead nodes should trigger firing rate issue."""
         nodes = {

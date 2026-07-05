@@ -18,6 +18,12 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — #330: wire signal_error() into congregation deliberation failure
+#   What: the "Congregation deliberation failed" except now also calls self._eco.signal_error(exc,
+#         context) — deposits raw error:healing_collective:<ExcType> to the Commons. Direct self._eco
+#         access (DiagnosisEngine owns the only live CommonsEco in THC), guarded for None.
+#   Why:  Punchlist #330 operational-logger — was debug-only, invisible outside a live log tail.
+#   How:  ng_commons_eco.py's new signal_error() (NeuroGraph 0d6cf4f).
 # [2026-06-29] Claude Code (Sonnet 4.6) — Remove broadcast_repair() JSONL double-write (#335)
 #   What: Step-7 no longer calls self._tier3.broadcast_repair() after CommonsEco.dual_record_outcome().
 #         CommonsEco IS the substrate-native broadcast — the JSONL write was a double-write and a
@@ -283,6 +289,11 @@ class DiagnosisEngine:
                     action = "auto_execute"
             except Exception as exc:
                 logger.debug("Congregation deliberation failed: %s", exc)
+                if self._eco is not None:
+                    self._eco.signal_error(exc, {
+                        "component": "congregation", "action": "deliberate",
+                        "tracking_id": tracking_id, "proposed_primitive": proposed_primitive,
+                    })
 
         result = DiagnosisResult(
             tracking_id=tracking_id,

@@ -24,6 +24,15 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — #330: wire signal_error() into 2 swallowed-exception sites
+#   What: THC pulse-cycle failures (_pulse_loop) and checkpoint failures (_do_checkpoint) now call
+#         self._engine._eco.signal_error(exc, context) alongside the existing log call — deposits raw
+#         error:healing_collective:<ExcType> to the Commons (guarded, since CommonsEco can be None).
+#         A demonstration wiring, not an ecosystem-wide except:pass sweep.
+#   Why:  Punchlist #330 operational-logger — both sites were previously log-only, invisible outside
+#         a live log tail.
+#   How:  ng_commons_eco.py's new signal_error() (NeuroGraph 0d6cf4f), called at the existing except
+#         sites, no control-flow change.
 # [2026-07-05] Claude Code (Sonnet 5) — NEW #353: fix .tier.value AttributeError (long-standing)
 #   What: _check_failure_from_river()'s diagnose() call built its metadata dict with
 #         self._calibrator.tier.value — but DetectionCalibrator.tier is a @property that
@@ -395,6 +404,10 @@ class HealingCollectiveHook(OpenClawAdapter):
                 self._pulse_cycle()
             except Exception as exc:
                 logger.debug("THC pulse cycle error: %s", exc)
+                if self._engine._eco is not None:
+                    self._engine._eco.signal_error(exc, {
+                        "component": "pulse_loop", "action": "pulse_cycle",
+                    })
             interval = (
                 self._conversation_interval
                 if self._in_conversation
@@ -737,6 +750,10 @@ class HealingCollectiveHook(OpenClawAdapter):
             logger.debug("Checkpoint completed")
         except Exception as exc:
             logger.warning("Checkpoint failed: %s", exc)
+            if self._engine._eco is not None:
+                self._engine._eco.signal_error(exc, {
+                    "component": "checkpoint", "action": "dvs_save",
+                })
         finally:
             self._schedule_checkpoint()
 

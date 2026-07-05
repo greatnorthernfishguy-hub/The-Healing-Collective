@@ -312,3 +312,26 @@ class TestMessageScanning:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     assert alias.name != "re", "re module should not be imported"
+
+
+class TestSignalError:
+    """#330: checkpoint failures call self._engine._eco.signal_error(exc, context)."""
+
+    def test_checkpoint_failure_signals_error(self, hook_instance):
+        calls = []
+        orig_signal_error = hook_instance._engine._eco.signal_error
+        hook_instance._engine._eco.signal_error = lambda exc, context=None: calls.append((exc, context))
+        orig_save = hook_instance._dvs.save
+        hook_instance._dvs.save = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full"))
+        try:
+            hook_instance._do_checkpoint()
+        finally:
+            hook_instance._dvs.save = orig_save
+            hook_instance._engine._eco.signal_error = orig_signal_error
+            if hook_instance._checkpoint_timer:
+                hook_instance._checkpoint_timer.cancel()
+
+        assert len(calls) == 1
+        exc, context = calls[0]
+        assert isinstance(exc, RuntimeError)
+        assert context["component"] == "checkpoint" and context["action"] == "dvs_save"

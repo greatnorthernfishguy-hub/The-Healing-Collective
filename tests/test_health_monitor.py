@@ -21,6 +21,9 @@ Tests for core/health_monitor.py — Background health monitoring.
 # -------------------
 """
 
+import contextlib
+import os
+import sys
 import time
 
 import numpy as np
@@ -28,6 +31,50 @@ import pytest
 
 from core.config import HealthMonitorConfig
 from core.health_monitor import HealthIssue, HealthMonitor, HealthReport
+
+_THC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _THC_DIR not in sys.path:
+    sys.path.insert(0, _THC_DIR)
+_NG_DIR = os.path.expanduser("~/NeuroGraph")
+if _NG_DIR not in sys.path:
+    sys.path.insert(0, _NG_DIR)
+
+import commons as commons_mod
+
+
+def _fake_embed(seed, dim=768):
+    rng = np.random.RandomState(seed)
+    v = rng.randn(dim).astype(np.float32)
+    return v / (np.linalg.norm(v) + 1e-8)
+
+
+def _make_commons_with_metrics(**metric_fields):
+    """Sandbox Commons pre-seeded with one metrics:neurograph:* deposit (#354).
+
+    Mirrors the real deposit shape from neurograph_rpc.py's _deposit_substrate_metrics():
+    raw weight_mean/weight_std/firing_rate_mean/firing_rate_std, no verdict applied.
+    """
+    commons = commons_mod.Commons()
+    commons.deposit(
+        _fake_embed(1), "metrics:neurograph:substrate_step:abc:1.0:1",
+        metadata={"timestamp": time.time(), "module_id": "neurograph", **metric_fields},
+    )
+    return commons
+
+
+@contextlib.contextmanager
+def _sandbox_commons(commons):
+    """Patch commons.get_commons() to return a sandbox instance (or None) for the block.
+
+    HealthMonitor._bucket_ng_metrics() does its OWN `from commons import get_commons` call
+    (a real bucket, not data handed to it) — this patches what that lazy import resolves to.
+    """
+    orig = commons_mod.get_commons
+    commons_mod.get_commons = lambda *a, **k: commons
+    try:
+        yield
+    finally:
+        commons_mod.get_commons = orig
 
 
 class MockNGLite:
@@ -96,87 +143,51 @@ class TestHealthReport:
 
 class TestHealthCheckWeightDivergence:
     def test_no_synapses_no_issue(self):
+        """No Commons deposit yet -> _bucket_ng_metrics() returns {} -> no issue."""
         config = HealthMonitorConfig()
-        eco = MockEcosystem(MockNGLite())
-        monitor = HealthMonitor(config=config, ng_ecosystem=eco, dvs=MockDVS())
-        report = monitor.check_health()
+        monitor = HealthMonitor(config=config, ng_ecosystem=None, dvs=MockDVS())
+        with _sandbox_commons(None):
+            report = monitor.check_health()
         assert report.healthy is True
 
     def test_balanced_weights_no_issue(self):
-        """Synapses with similar weights should not trigger divergence."""
-        synapses = {
-            ("a", "b"): MockSynapse(0.5),
-            ("a", "c"): MockSynapse(0.6),
-            ("b", "c"): MockSynapse(0.55),
-        }
-        ng = MockNGLite(synapses=synapses)
-        eco = MockEcosystem(ng)
-        monitor = HealthMonitor(
-            config=HealthMonitorConfig(), ng_ecosystem=eco, dvs=MockDVS(),
-        )
-        report = monitor.check_health()
-        # Low std_dev / mean should not exceed threshold
+        """Similar synapse weights (low std/mean) should not trigger divergence."""
+        monitor = HealthMonitor(config=HealthMonitorConfig(), ng_ecosystem=None, dvs=MockDVS())
+        commons = _make_commons_with_metrics(weight_mean=0.55, weight_std=0.02)
+        with _sandbox_commons(commons):
+            report = monitor.check_health()
         issues = [i for i in report.issues if i.category == "weight_divergence"]
         assert len(issues) == 0
 
-    @pytest.mark.xfail(
-        reason="#354: _check_weight_divergence() is stubbed to `return None` unconditionally "
-                "(orphaned during the ng_ecosystem=None migration, never reconnected to the "
-                "Commons) — a real regression, not test staleness. See test file changelog.",
-        strict=True,
-    )
     def test_extreme_weights_triggers_issue(self):
-        """Synapses with extreme divergence should trigger an issue."""
-        synapses = {
-            ("a", "b"): MockSynapse(0.01),
-            ("a", "c"): MockSynapse(0.99),
-            ("b", "c"): MockSynapse(0.01),
-            ("c", "d"): MockSynapse(0.99),
-        }
-        ng = MockNGLite(synapses=synapses)
-        eco = MockEcosystem(ng)
-        # Use a very low threshold to ensure it triggers
+        """Widely diverged synapse weights (high std/mean ratio) should trigger an issue."""
+        # mean=0.5, std=0.49 (weights near 0.01/0.99) -> divergence ratio ~0.98
         config = HealthMonitorConfig(weight_divergence_threshold=0.5)
-        monitor = HealthMonitor(config=config, ng_ecosystem=eco, dvs=MockDVS())
-        report = monitor.check_health()
+        monitor = HealthMonitor(config=config, ng_ecosystem=None, dvs=MockDVS())
+        commons = _make_commons_with_metrics(weight_mean=0.5, weight_std=0.49)
+        with _sandbox_commons(commons):
+            report = monitor.check_health()
         divergence_issues = [i for i in report.issues if i.category == "weight_divergence"]
         assert len(divergence_issues) == 1
 
 
 class TestHealthCheckFiringRates:
     def test_no_dead_nodes(self):
-        """All active nodes should not trigger firing rate issue."""
-        nodes = {
-            "a": MockNode(activation_count=100),
-            "b": MockNode(activation_count=80),
-        }
-        ng = MockNGLite(nodes=nodes)
-        eco = MockEcosystem(ng)
-        monitor = HealthMonitor(
-            config=HealthMonitorConfig(), ng_ecosystem=eco, dvs=MockDVS(),
-        )
-        report = monitor.check_health()
+        """Healthy substrate-wide firing rate should not trigger an issue."""
+        monitor = HealthMonitor(config=HealthMonitorConfig(), ng_ecosystem=None, dvs=MockDVS())
+        commons = _make_commons_with_metrics(firing_rate_mean=0.5)
+        with _sandbox_commons(commons):
+            report = monitor.check_health()
         rate_issues = [i for i in report.issues if i.category == "low_firing_rate"]
         assert len(rate_issues) == 0
 
-    @pytest.mark.xfail(
-        reason="#354: _check_firing_rates() is stubbed to `return None` unconditionally "
-                "(orphaned during the ng_ecosystem=None migration, never reconnected to the "
-                "Commons) — a real regression, not test staleness. See test file changelog.",
-        strict=True,
-    )
     def test_mostly_dead_nodes(self):
-        """Majority dead nodes should trigger firing rate issue."""
-        nodes = {
-            f"n_{i}": MockNode(activation_count=0) for i in range(10)
-        }
-        # One active node to ensure total_outcomes > 0
-        nodes["active"] = MockNode(activation_count=1000)
-        ng = MockNGLite(nodes=nodes)
-        eco = MockEcosystem(ng)
+        """Substrate-wide firing rate below min_firing_rate should trigger an issue."""
         config = HealthMonitorConfig(min_firing_rate=0.001)
-        monitor = HealthMonitor(config=config, ng_ecosystem=eco, dvs=MockDVS())
-        report = monitor.check_health()
+        monitor = HealthMonitor(config=config, ng_ecosystem=None, dvs=MockDVS())
+        commons = _make_commons_with_metrics(firing_rate_mean=0.0001)
+        with _sandbox_commons(commons):
+            report = monitor.check_health()
         rate_issues = [i for i in report.issues if i.category == "low_firing_rate"]
         assert len(rate_issues) == 1
 

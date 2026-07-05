@@ -9,6 +9,33 @@ The Health Monitor is the Collective's immune system: always running,
 mostly quiet, occasionally nudging the substrate back toward health.
 
 # ---- Changelog ----
+# [2026-07-05] Claude Code (Sonnet 5) — #354: reconnect weight-divergence + firing-rate checks
+#   What: _check_weight_divergence() and _check_firing_rates() were stubbed `return None`
+#         unconditionally since 2026-04-08 (Josh's own commit d877888, "tract-only mode" —
+#         self._eco._ng no longer exists once ng_ecosystem=None). Restored via a REAL bucket:
+#         a new _bucket_ng_metrics() reads metrics:neurograph:* directly from the Commons
+#         (commons.bucket_recent) — HealthMonitor is its own consumer, no data handed to it
+#         by the hook. NG deposits RAW weight_mean/weight_std/firing_rate_mean/firing_rate_std
+#         (first/second moments of already-native per-element quantities — synapse.weight,
+#         node.firing_rate_ema; no threshold applied on NG's side). Both checks restore the
+#         EXACT original formula from git history (commit d877888's parent) — divergence =
+#         std/mean compared against weight_divergence_threshold, same severity calc.
+#         _check_firing_rates adapted: the original computed per-node activation_count/
+#         total_outcomes and a dead-node PERCENTAGE — that per-node lifetime data no longer
+#         exists in this architecture (Tier-2 per-module ng_lite instances are gone). Uses
+#         firing_rate_mean directly against min_firing_rate as a substrate-wide proxy for the
+#         same intent ("is the substrate carrying too much dead weight") — an honest
+#         approximation, not a byte-identical restoration, documented as such (LAW 3).
+#   Why:  First correction attempt (this session) drifted toward two anti-patterns Josh
+#         caught: (1) NG pre-computing a "divergence ratio"/"dead percentage" verdict before
+#         depositing (LAW 7 — classification belongs at extraction, not at deposit); (2) the
+#         hook pre-fetching/EWMA-ing values and pushing them into HealthMonitor via a setter
+#         (a push/move-the-data pattern, not a bucket). Corrected: NG deposits raw moments
+#         only; HealthMonitor dips its own bucket directly, same as every other THC consumer.
+#   How:  _bucket_ng_metrics() — get_commons(), bucket_recent(with_metadata=True), filter
+#         metrics:neurograph:*, return the newest deposit's metadata dict (fail-soft, no
+#         Commons/no data → {}). Both checks call it independently (fresh read each check
+#         cycle — 120s interval, no staleness risk worth caching).
 # [2026-02-27] Claude (Opus 4.6) — Initial creation.
 #   What: HealthMonitor with background thread, three health checks
 #         (weight divergence, firing rate, novelty saturation), and
@@ -221,23 +248,97 @@ class HealthMonitor:
 
         return report
 
+    def _bucket_ng_metrics(self) -> Dict[str, Any]:
+        """Bucket the newest metrics:neurograph:* deposit from the Commons (#354).
+
+        HealthMonitor's OWN direct bucket read — no data handed to it by the hook or any
+        other collaborator. Returns the raw metadata dict (weight_mean/weight_std/
+        firing_rate_mean/firing_rate_std/...) with no interpretation applied; {} if no
+        Commons or no matching deposit yet (fail-soft).
+        """
+        try:
+            from commons import get_commons
+            commons = get_commons()
+        except Exception:
+            return {}
+        if commons is None:
+            return {}
+        try:
+            recs = commons.bucket_recent(limit=50, with_metadata=True)
+        except Exception as exc:
+            logger.debug("HealthMonitor Commons metrics bucket failed: %s", exc)
+            return {}
+        newest_ts, newest_meta = -1.0, {}
+        for target_id, _w, _r, meta in recs:
+            if not target_id.startswith("metrics:neurograph:") or not isinstance(meta, dict):
+                continue
+            ts = meta.get("timestamp", 0.0)
+            if ts >= newest_ts:
+                newest_ts, newest_meta = ts, meta
+        return newest_meta
+
     def _check_weight_divergence(self, ng_stats: Dict[str, Any]) -> Optional[HealthIssue]:
-        """Check if synapse weights are dangerously diverged.
+        """Check if synapse weights are dangerously diverged (#354, restored via Commons bucket).
 
         Weight divergence indicates the substrate has learned extreme
         associations — some synapses near 1.0, others near 0.0 — which
         reduces its ability to adapt to new patterns.
         """
-        return None  # synapse health from topology delta
+        meta = self._bucket_ng_metrics()
+        mean_weight = meta.get("weight_mean")
+        std_dev = meta.get("weight_std")
+        if mean_weight is None or std_dev is None:
+            return None
+
+        divergence = std_dev / mean_weight if mean_weight > 0 else std_dev
+
+        if divergence > self._config.weight_divergence_threshold:
+            return HealthIssue(
+                category="weight_divergence",
+                severity=min(1.0, divergence / (self._config.weight_divergence_threshold * 2)),
+                description=(
+                    f"Substrate weight divergence ({divergence:.2f}) exceeds "
+                    f"threshold ({self._config.weight_divergence_threshold}). "
+                    f"Mean={mean_weight:.3f}, StdDev={std_dev:.3f}"
+                ),
+                metadata={
+                    "divergence": divergence,
+                    "mean_weight": mean_weight,
+                    "std_dev": std_dev,
+                },
+            )
+        return None
 
     def _check_firing_rates(self, ng_stats: Dict[str, Any]) -> Optional[HealthIssue]:
-        """Check for dead or underactive nodes.
+        """Check for substrate-wide underactivity (#354, restored via Commons bucket).
 
-        Nodes that never fire are wasting capacity.  If too many nodes
-        have firing rates below min_firing_rate, the substrate is
-        carrying dead weight that should be pruned.
+        Nodes that never fire are wasting capacity. The original check computed a
+        per-node dead-node PERCENTAGE from lifetime activation_count — that per-node
+        data no longer exists in this architecture (Tier-2 per-module ng_lite instances
+        are gone). This uses firing_rate_mean directly against min_firing_rate as a
+        substrate-wide proxy for the same intent: is the substrate carrying too much
+        dead weight. Honest approximation, not a byte-identical restoration (LAW 3).
         """
-        return None  # node health from topology delta
+        meta = self._bucket_ng_metrics()
+        firing_rate_mean = meta.get("firing_rate_mean")
+        if firing_rate_mean is None:
+            return None
+
+        if firing_rate_mean < self._config.min_firing_rate:
+            return HealthIssue(
+                category="low_firing_rate",
+                severity=min(1.0, 1.0 - (firing_rate_mean / max(self._config.min_firing_rate, 1e-9))),
+                description=(
+                    f"Substrate-wide firing rate ({firing_rate_mean:.4f}) below "
+                    f"min_firing_rate ({self._config.min_firing_rate}). "
+                    f"Substrate may be carrying dead weight."
+                ),
+                metadata={
+                    "firing_rate_mean": firing_rate_mean,
+                    "firing_rate_std": meta.get("firing_rate_std"),
+                },
+            )
+        return None
 
     def _check_novelty_saturation(self) -> Optional[HealthIssue]:
         """Check if substrate is losing discriminative power.

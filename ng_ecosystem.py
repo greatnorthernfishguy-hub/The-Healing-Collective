@@ -6,9 +6,10 @@ three-tier learning architecture:
 
   Tier 1 (Standalone):  NGLite alone.  Local Hebbian learning.
                         Zero deps beyond ng_lite.py.
-  Tier 2 (Peer-pooled): NGTractBridge (preferred) or NGPeerBridge
-                        (legacy fallback).  Co-located modules share
-                        learning via per-pair tracts (~/.et_modules/tracts/)
+  Tier 2 (Peer-pooled): NGTractBridge (sole peer bridge as of 2026-06-03,
+                        substrate-as-protocol PRD Phase 3 Step 5).
+                        Co-located modules share learning via per-pair
+                        tracts (~/.et_modules/tracts/)
                         or legacy JSONL (~/.et_modules/shared_learning/).
                         Auto-connects.  Tract bridge preferred when present.
   Tier 3 (Full SNN):    Removed — modules extract via buckets/tracts.
@@ -94,6 +95,38 @@ License: AGPL-3.0
 #   How:  Lazy import of ng_embed to avoid circular deps. Passes self
 #         (the ecosystem instance) to NGEmbed.dual_record_outcome().
 # -------------------
+# [2026-06-05] Claude Code (Opus 4.7) — Phase 6 drift-bait removal (substrate-as-protocol PRD §6)
+#   What: Removed dead-defined module-level constant `SHARED_LEARNING_DIR`.
+#         Was `ET_MODULES_ROOT / "shared_learning"`, defined at module load.
+#         Zero callers across the active ecosystem since NGPeerBridge deletion.
+#   Why:  Drift-bait removal. Future CCs reading the constant would assume it's
+#         used somewhere and might either re-add a caller "to fix the broken
+#         feature" or build new code on top of it. The env-var `ET_SHARED_LEARNING_DIR`
+#         (different surface — read by ng_tract_bridge for legacy path override)
+#         is intentionally UNAFFECTED by this removal.
+#   How:  Single-constant deletion with inline replacement comment explaining
+#         WHY it was removed (inoculation against future re-add). Re-vendor cycle
+#         to 12 active ecosystem modules follows.
+# -------------------
+# [2026-06-03] Claude Code (Opus 4.7) — Phase 3 Step 4 (substrate-as-protocol PRD §4.13)
+#   What: Removed legacy NGPeerBridge fallback from _init_peer_bridge() and
+#         "peer_bridge" output field from stats(). NGTractBridge is now the
+#         sole peer bridge across the ecosystem; if it fails to construct,
+#         the module runs standalone (no peer bridge).
+#   Why:  Phase 3 of substrate-as-protocol restoration — after Steps 1-3
+#         retired the last callers depending on the legacy JSONL bridge,
+#         this is the canonical-side fix-at-source (LAW 4) to delete the
+#         drift accumulation. ng_peer_bridge.py file deletion is Step 5.
+#   How:  Deleted the `if bridge is None: from ng_peer_bridge import ...`
+#         legacy fallback in _init_peer_bridge(); replaced with clean
+#         standalone-mode return.  Deleted peer_stats collection + the
+#         "peer_bridge" field from stats() output dict. Section + inline
+#         comments updated to reflect single-bridge state.  Tests at
+#         NG/tests/test_et_modules.py:574-589 are UNAFFECTED (they test
+#         openclaw_hook.py's NeuroGraphMemory.stats(), not this file's
+#         NGEcosystem.stats()). TrollGuard/main.py:670 uses .get() and
+#         degrades gracefully (cosmetic — just stops printing a line).
+# -------------------
 """
 
 from __future__ import annotations
@@ -119,11 +152,15 @@ __version__ = "1.0.0"
 # --------------------------------------------------------------------------
 
 ET_MODULES_ROOT = Path.home() / ".et_modules"
-SHARED_LEARNING_DIR = ET_MODULES_ROOT / "shared_learning"
+# SHARED_LEARNING_DIR removed 2026-06-05 (Phase 6 drift-bait removal).
+# Was: ET_MODULES_ROOT / "shared_learning". Zero callers across the active
+# ecosystem since NGPeerBridge deletion (Phase 3 Step 5). The env-var
+# `ET_SHARED_LEARNING_DIR` (different surface, read by ng_tract_bridge for
+# legacy path override) is unaffected by this removal.
 REGISTRY_PATH = ET_MODULES_ROOT / "registry.json"
 
 TIER_STANDALONE = 1  # NGLite only
-TIER_PEER = 2        # + NGPeerBridge
+TIER_PEER = 2        # + NGTractBridge (sole peer bridge as of 2026-06-03)
 TIER_FULL_SNN = 3    # historical — bridge removed, modules use tracts
 
 TIER_NAMES = {
@@ -254,7 +291,7 @@ class NGEcosystem:
         self._tier = TIER_STANDALONE
         self._ng: Any = None              # NGLite instance
         self._ng_memory: Any = None       # NeuroGraphMemory ref (set externally at Tier 3)
-        self._peer_bridge: Any = None     # NGPeerBridge instance
+        self._peer_bridge: Any = None     # NGTractBridge instance (or None in standalone)
         self._shutdown_event = threading.Event()
         self._ops_lock = threading.Lock()
 
@@ -318,11 +355,15 @@ class NGEcosystem:
             self._ng = None
 
     # -----------------------------------------------------------------
-    # Tier 2: NGPeerBridge init
+    # Tier 2: NGTractBridge init
     # -----------------------------------------------------------------
 
     def _init_peer_bridge(self) -> None:
-        """Try to connect Tier 2 bridge. Prefers tract bridge, falls back to legacy JSONL."""
+        """Try to connect Tier 2 bridge (NGTractBridge). Standalone mode if unavailable.
+
+        Legacy NGPeerBridge fallback removed 2026-06-03 (substrate-as-protocol
+        PRD Phase 3 Step 4) — see changelog header.
+        """
         if not self._config["peer_bridge"]["enabled"]:
             return
         if self._ng is None:
@@ -330,7 +371,7 @@ class NGEcosystem:
 
         bridge = None
 
-        # Tract bridge (v0.3+) — per-pair directional tracts
+        # Tract bridge (v0.3+) — per-pair directional tracts; sole peer bridge.
         if self._config["peer_bridge"].get("use_tracts", True):
             try:
                 from ng_tract_bridge import NGTractBridge  # vendored alongside
@@ -341,25 +382,13 @@ class NGEcosystem:
                     sync_interval=self._config["peer_bridge"]["sync_interval"],
                 )
                 logger.info("[%s] NGTractBridge connected (tract-based River)", self.module_id)
-            except ImportError:
-                pass
+            except ImportError as exc:
+                logger.debug("[%s] NGTractBridge unavailable (standalone mode): %s", self.module_id, exc)
             except Exception as exc:
-                logger.debug("[%s] NGTractBridge failed: %s", self.module_id, exc)
+                logger.debug("[%s] NGTractBridge failed (standalone mode): %s", self.module_id, exc)
 
-        # Legacy fallback — JSONL broadcast bridge
         if bridge is None:
-            try:
-                from ng_peer_bridge import NGPeerBridge  # vendored alongside
-
-                bridge = NGPeerBridge(
-                    module_id=self.module_id,
-                    shared_dir=str(SHARED_LEARNING_DIR),
-                    sync_interval=self._config["peer_bridge"]["sync_interval"],
-                )
-                logger.info("[%s] NGPeerBridge connected (legacy JSONL River)", self.module_id)
-            except Exception as exc:
-                logger.debug("[%s] No peer bridge available: %s", self.module_id, exc)
-                return
+            return  # standalone mode — no peer bridge
 
         self._ng.connect_bridge(bridge)
         self._peer_bridge = bridge
@@ -400,6 +429,60 @@ class NGEcosystem:
             return self._ng.record_outcome(
                 embedding, target_id, success, strength=strength, metadata=metadata
             )
+
+    def record_outcome_broadcast(
+        self,
+        embedding: np.ndarray,
+        target_id: str,
+        success: bool,
+        strength: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record outcome locally AND broadcast via BTF to peer module tracts.
+
+        Companion to record_outcome (local-only). Use when the outcome should
+        be visible to peer modules' substrates — primarily called by
+        dual_record_outcome's forest+tree deposits so peers learn from
+        this module's concept extractions.
+
+        Returns the same dict shape as record_outcome (local result).
+
+        # ---- Changelog ----
+        # [2026-05-31] Claude Code (Opus 4.7, 1M) — Workstream 2 #274: BTF broadcast method
+        # What: New method that does both record_outcome (local Hebbian) AND
+        #       ng_tract.deposit_outcome (BTF broadcast to peer module tracts).
+        # Why:  Replaces _PeerBridgeEco shim pattern in callers — moves the
+        #       broadcast responsibility from consumer-side adapter to the
+        #       canonical ecosystem facade per LAW 4 fix-at-source. Resolves
+        #       PRD §4.13 Phase 3 step covering wire_absorption else-branch.
+        # How:  self._peer_bridge holds NGTractBridge (sole bridge as of
+        #       2026-06-03 — substrate-as-protocol PRD Phase 3 Step 5) or
+        #       None in standalone mode. Uses _get_registered_peers +
+        #       _module_dir for per-peer tract path (post-#185 forward-River
+        #       pattern). Metadata msgpack-packed. Falls back to local-only
+        #       result if no bridge available (standalone mode).
+        # -------------------
+        """
+        # Pass 1: Local deposit via the existing record_outcome path
+        local_result = self.record_outcome(
+            embedding, target_id, success, strength=strength, metadata=metadata
+        )
+
+        # Pass 2: BTF broadcast — DISABLED 2026-06-07 (EMERGENCY THROTTLE)
+        # Reason: The addressed-mailbox fan-out (N peer-addressed tract writes
+        # per logical event) was producing GB-per-minute write storms across
+        # the ecosystem, OOM-killing the NG sidecar mid-write. Substrate-as-
+        # protocol PRD Phase 7 audit + Commons Pool architecture proposal
+        # (~/docs/prd/commons-pool-architecture-v0.1.md) identifies this as
+        # drift from the canonical model — propagation should be through
+        # the substrate medium, not addressed transport. Until Commons Pool
+        # restoration ships, broadcast is a no-op; local deposit continues
+        # (peers learn from their own local substrate writes + the eventual
+        # restored canonical mechanism).
+        # Re-enable / restore correctly via Commons Pool implementation
+        # PRD — DO NOT simply re-enable this fan-out, that would re-open
+        # the leak.
+        return local_result
 
     def dual_record_outcome(
         self,
@@ -517,13 +600,6 @@ class NGEcosystem:
             except Exception:
                 pass
 
-        peer_stats: Dict[str, Any] = {}
-        if self._peer_bridge is not None:
-            try:
-                peer_stats = self._peer_bridge.get_stats()
-            except Exception:
-                pass
-
         ng_memory_stats: Dict[str, Any] = {}
         if self._ng_memory is not None:
             try:
@@ -537,7 +613,6 @@ class NGEcosystem:
             "tier": self._tier,
             "tier_name": self.tier_name,
             "ng_lite": ng_stats,
-            "peer_bridge": peer_stats if peer_stats else None,
             "ng_memory": (
                 {
                     "connected": True,

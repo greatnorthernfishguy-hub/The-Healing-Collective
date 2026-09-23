@@ -18,6 +18,18 @@ ENFORCEMENT: execute() is NEVER called without preceding validate()
 returning passed=True.  This is enforced in code, not by convention.
 
 # ---- Changelog ----
+# [2026-09-22] Claude Code (Kimi k2.7-code) — Zone Z11: fail-closed embedding in diagnose()
+#   What: Step 1 embedding now catches EmbeddingUnavailableError / DualPassIncompleteError from
+#         the injected embed_fn. On failure it returns a degraded DiagnosisResult
+#         (action_taken="silent_log", confidence=0.0, proposed_primitive=None) WITHOUT adding
+#         any FAILURE_SIGNATURE or REPAIR_RECORD entry to the DVS. The tracking_id is still
+#         returned so the host API stays stable.
+#   Why:  healing_collective_hook.py _embed() no longer fabricates hash fallback vectors.
+#         If ng_embed cannot produce a real embedding, THC must not poison the substrate with
+#         a fake vector or run diagnosis on fabricated data.
+#   How:  Imported the two public ng_embed exceptions (with fallbacks for test environments).
+#         Wrapped self._embed_fn(description) in a try/except; on failure build a degraded
+#         result, record it in self._tracking, and return immediately.
 # [2026-07-05] Claude Code (Sonnet 5) — #330: wire signal_error() into congregation deliberation failure
 #   What: the "Congregation deliberation failed" except now also calls self._eco.signal_error(exc,
 #         context) — deposits raw error:healing_collective:<ExcType> to the Commons. Direct self._eco
@@ -94,6 +106,18 @@ from core.repair_primitives import (
     RepairPrimitive,
     ValidationResult,
 )
+
+# ng_embed is vendored; import its public exceptions for fail-closed handling.
+# If ng_embed is not importable in this environment, define harmless sentinels
+# so the module still loads and tests can supply mock embedders.
+try:
+    from ng_embed import EmbeddingUnavailableError, DualPassIncompleteError
+except Exception:  # noqa: BLE001
+    class EmbeddingUnavailableError(Exception):  # type: ignore[no-redef]
+        """Placeholder when ng_embed is not on path."""
+
+    class DualPassIncompleteError(Exception):  # type: ignore[no-redef]
+        """Placeholder when ng_embed is not on path."""
 
 logger = logging.getLogger("healing_collective.diagnosis_engine")
 
@@ -198,7 +222,36 @@ class DiagnosisEngine:
         self._failures_observed += 1
 
         # --- Step 1: Observe ---
-        embedding = self._embed_fn(description)
+        try:
+            embedding = self._embed_fn(description)
+        except (EmbeddingUnavailableError, DualPassIncompleteError) as exc:
+            logger.warning(
+                "[%s] Embedding unavailable for diagnosis; failing closed (silent_log): %s",
+                tracking_id, exc,
+            )
+            degraded = DiagnosisResult(
+                tracking_id=tracking_id,
+                failure_description=description,
+                novelty=context.get("substrate_novelty", 1.0),
+                proposed_primitive=None,
+                confidence=0.0,
+                action_taken="silent_log",
+                diagnostic_chain={
+                    "tracking_id": tracking_id,
+                    "failure_description": description,
+                    "source": source,
+                    "novelty": context.get("substrate_novelty", 1.0),
+                    "proposed_primitive": None,
+                    "confidence": 0.0,
+                    "action_taken": "silent_log",
+                    "embedding_unavailable": True,
+                    "error": str(exc),
+                    "timestamp": time.time(),
+                },
+            )
+            self._tracking[tracking_id] = degraded
+            return degraded
+
         failure_entry = DVSEntry.create(
             entry_type=DVSEntryType.FAILURE_SIGNATURE,
             source_module=source,
@@ -535,6 +588,9 @@ class DiagnosisEngine:
                 if result.execution_result else None
             ),
             "timestamp": result.timestamp,
+            "embedding_unavailable": result.diagnostic_chain.get(
+                "embedding_unavailable", False
+            ),
         }
 
     def stats(self) -> Dict[str, Any]:

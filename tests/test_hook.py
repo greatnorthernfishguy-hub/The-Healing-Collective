@@ -24,6 +24,7 @@ by mocking ng_ecosystem.init().
 # -------------------
 """
 
+import commons as commons_mod
 import hashlib
 import importlib
 import os
@@ -37,10 +38,36 @@ from unittest import mock
 import numpy as np
 import pytest
 
+_THC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _THC_DIR not in sys.path:
+    sys.path.insert(0, _THC_DIR)
+_NG_DIR = os.path.expanduser("~/NeuroGraph")
+if _NG_DIR not in sys.path:
+    sys.path.insert(0, _NG_DIR)
+
+from ng_embed import EmbeddingUnavailableError
+
 
 def _hash_embed(text: str, dims: int = 768) -> np.ndarray:
-    """Deterministic hash-based embedding for testing."""
+    """DEPRECATED: deterministic hash-based embedding (kept for callers outside this module).
+
+    This helper is no longer used inside this file; all new tests use `_fake_embed()`
+    which produces unit vectors in the same 768-dim space as canonical ng_embed.
+    """
     rng_seed = int(hashlib.sha256(text.encode()).hexdigest(), 16) % (2**32)
+    rng = np.random.RandomState(rng_seed)
+    vec = rng.randn(dims).astype(np.float32)
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+
+def _fake_embed(text, dims: int = 768) -> np.ndarray:
+    """Deterministic embedding that mimics ng_embed's 768-dim contract.
+
+    Used to mock ng_embed.embed in tests so we never hit the network or ONNX
+    model load, while still producing stable vectors comparable via cosine.
+    """
+    rng_seed = int(hashlib.sha256(str(text).encode()).hexdigest(), 16) % (2**32)
     rng = np.random.RandomState(rng_seed)
     vec = rng.randn(dims).astype(np.float32)
     norm = np.linalg.norm(vec)
@@ -126,8 +153,12 @@ def hook_instance(tmp_path):
         with mock.patch("ng_ecosystem.init", return_value=mock_eco):
             # Mock sentence_transformers to use hash embedding
             with mock.patch.dict(sys.modules, {"sentence_transformers": None}):
-                instance = hch.get_instance()
-                yield instance
+                # Mock ng_embed so tests never download models or hit ONNX.
+                with mock.patch("ng_embed.embed", _fake_embed):
+                    # Isolate module data dir (DVS, checkpoints, calibrator) per test.
+                    with mock.patch("pathlib.Path.home", return_value=tmp_path):
+                        instance = hch.get_instance()
+                        yield instance
 
     # Cleanup singleton
     hch._INSTANCE = None
@@ -144,9 +175,11 @@ class TestSingleton:
         }):
             with mock.patch("ng_ecosystem.init", return_value=mock_eco):
                 with mock.patch.dict(sys.modules, {"sentence_transformers": None}):
-                    inst1 = hch.get_instance()
-                    inst2 = hch.get_instance()
-                    assert inst1 is inst2
+                    with mock.patch("ng_embed.embed", _fake_embed):
+                        with mock.patch("pathlib.Path.home", return_value=tmp_path):
+                            inst1 = hch.get_instance()
+                            inst2 = hch.get_instance()
+                            assert inst1 is inst2
 
         hch._INSTANCE = None
 
@@ -260,7 +293,7 @@ class TestMessageScanning:
         ) as spy:
             hook_instance._check_failure_from_river({
                 "text": "Something completely unprecedented happened",
-                "embedding": _hash_embed("Something completely unprecedented happened"),
+                "embedding": _fake_embed("Something completely unprecedented happened"),
             })
         assert spy.called, "high novelty should trigger diagnose() even with no DVS match"
         _, kwargs = spy.call_args
@@ -276,7 +309,7 @@ class TestMessageScanning:
         ) as spy:
             hook_instance._check_failure_from_river({
                 "text": "The weather is nice today",
-                "embedding": _hash_embed("The weather is nice today"),
+                "embedding": _fake_embed("The weather is nice today"),
             })
         assert not spy.called, "low similarity + low novelty must not trigger diagnose()"
 
@@ -290,7 +323,7 @@ class TestMessageScanning:
         ) as spy:
             hook_instance._check_failure_from_river({
                 "text": "Routine status check",
-                "embedding": _hash_embed("Routine status check"),
+                "embedding": _fake_embed("Routine status check"),
             })
         assert spy.called
         _, kwargs = spy.call_args
@@ -335,3 +368,96 @@ class TestSignalError:
         exc, context = calls[0]
         assert isinstance(exc, RuntimeError)
         assert context["component"] == "checkpoint" and context["action"] == "dvs_save"
+
+
+class TestEmbedFailClosed:
+    """Fail-closed _embed: no hash fallback; degraded diagnosis when ng_embed is unavailable."""
+
+    def _commons_with_experience(self) -> "commons_mod.Commons":
+        """Build a sandbox Commons and deposit one experience:* turn."""
+        c = commons_mod.Commons()
+        c.deposit(
+            _fake_embed("turn0"), "experience:turn0",
+            metadata={"user_text": "This is a synthetic failure turn"},
+        )
+        return c
+    
+    def test_embed_raises_without_hash_fallback(self, hook_instance):
+        """If ng_embed raises, _embed must propagate — never return a fabricated vector."""
+        with mock.patch(
+            "ng_embed.embed",
+            side_effect=EmbeddingUnavailableError("model unavailable"),
+        ):
+            with pytest.raises(EmbeddingUnavailableError):
+                hook_instance._embed("any failure description")
+
+    def test_report_failure_degraded_when_embedding_unavailable(self, hook_instance):
+        """Host API stays stable: returns a tracking id with a silent_log result."""
+        before = hook_instance._dvs.size
+        with mock.patch(
+            "ng_embed.embed",
+            side_effect=EmbeddingUnavailableError("model unavailable"),
+        ):
+            tracking_id = hook_instance.report_failure("DB connection timeout")
+
+        assert isinstance(tracking_id, str) and len(tracking_id) > 0
+        assert hook_instance._dvs.size == before, "embedding failure must not write to DVS"
+
+        status = hook_instance.get_healing_status(tracking_id)
+        assert status is not None
+        assert status["action_taken"] == "silent_log"
+        assert status["confidence"] == 0.0
+        assert status["proposed_primitive"] is None
+        assert status["execution_status"] is None
+        assert status.get("embedding_unavailable") is True
+
+    def test_commons_experience_embed_failure_signals_error(self, hook_instance):
+        """Embedding failure while bucketing experience:* must call signal_error()."""
+        calls = []
+        orig_signal_error = hook_instance._engine._eco.signal_error
+        hook_instance._engine._eco.signal_error = lambda exc, context=None: calls.append((exc, context))
+        try:
+            from commons import Commons
+            commons = Commons()
+            commons.deposit(
+                _fake_embed("turn0"), "experience:turn0",
+                metadata={"user_text": "This is a synthetic failure turn"},
+            )
+
+            with mock.patch(
+                "ng_embed.embed",
+                side_effect=EmbeddingUnavailableError("model unavailable in bucket"),
+            ):
+                with mock.patch("commons.get_commons", return_value=commons):
+                    hook_instance._bucket_commons_experience()
+        finally:
+            hook_instance._engine._eco.signal_error = orig_signal_error
+
+        assert len(calls) == 1
+        exc, context = calls[0]
+        assert isinstance(exc, EmbeddingUnavailableError)
+        assert context["component"] == "_bucket_commons_experience"
+        assert context["action"] == "_embed"
+
+    def test_commons_experience_embed_failure_does_not_record_calibrator_outcome(self, hook_instance):
+        """Embedding outage in _bucket_commons_experience must not count as a detection outcome."""
+        cal_before = hook_instance._calibrator.stats()["total_observations"]
+
+        from commons import Commons
+        commons = Commons()
+        commons.deposit(
+            _fake_embed("turn0"), "experience:turn0",
+            metadata={"user_text": "This is a synthetic failure turn"},
+        )
+        # Trigger threshold is set high through calibrator default.
+        hook_instance._substrate_novelty = 1.0
+
+        with mock.patch(
+            "ng_embed.embed",
+            side_effect=EmbeddingUnavailableError("model unavailable in bucket"),
+        ):
+            with mock.patch("commons.get_commons", return_value=commons):
+                hook_instance._bucket_commons_experience()
+
+        cal_after = hook_instance._calibrator.stats()["total_observations"]
+        assert cal_after == cal_before, "embedding outage must not write calibration outcome"

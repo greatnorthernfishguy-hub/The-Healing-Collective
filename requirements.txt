@@ -1,6 +1,11 @@
 # The Healing Collective — Dependencies
 #
 # Changelog:
+# [2026-09-22] Claude Code (Kimi k2.7-code) — Zone Z11: add canonical ng_embed deps.
+#   What: Added onnxruntime, tokenizers, huggingface_hub (lazy-loaded by ng_embed).
+#   Why:  ng_embed.py now requires these for Snowflake/snowflake-arctic-embed-m-v1.5 ONNX
+#         embedding. fastembed is retained for backward compat / non-canonical paths.
+#   How:  Listed below alongside existing deps; versions mirror NeuroGraph canonical.
 # [2026-02-26] Claude (Opus 4.6) — Initial creation.
 #   Mirrors TrollGuard's dependency pattern for E-T Systems consistency.
 #   Core deps are required; optional deps have comments.
@@ -12,3 +17,8 @@ msgpack                 # DVS primary persistence format
 
 # --- Embeddings (Tier 1/2) ---
 fastembed>=0.2.0        # all-MiniLM-L6-v2 via ONNX Runtime (no torch dependency)
+
+# --- Canonical ecosystem embedding (ng_embed.py, lazy-loaded) ---
+onnxruntime             # Snowflake/snowflake-arctic-embed-m-v1.5 ONNX inference
+tokenizers              # BERT tokenizer for windowed encoding
+huggingface_hub         # Model download from Hugging Face Hub

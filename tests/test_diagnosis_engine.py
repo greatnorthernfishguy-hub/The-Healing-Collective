@@ -98,6 +98,41 @@ def _make_engine(config=None):
 class TestDiagnosisPipeline:
     """Test the seven-step diagnosis pipeline."""
 
+    def test_embedding_unavailable_returns_degraded_result(self):
+        """Fail-closed: if embedder cannot produce a vector, do not fabricate."""
+        from ng_embed import EmbeddingUnavailableError
+
+        engine = _make_engine()
+        before = engine._dvs.size
+        engine._embed_fn = lambda _text: (_ for _ in ()).throw(
+            EmbeddingUnavailableError("embedding model unavailable")
+        )
+        result = engine.diagnose("DB connection timeout")
+
+        assert engine._dvs.size == before, "embedding failure must not write to DVS"
+        assert result.action_taken == "silent_log"
+        assert result.proposed_primitive is None
+        assert result.confidence == 0.0
+
+        status = engine.get_status(result.tracking_id)
+        assert status is not None
+        assert status["action_taken"] == "silent_log"
+
+    def test_dual_pass_incomplete_returns_degraded_result(self):
+        """Fail-closed: DualPassIncompleteError is also treated as unavailable."""
+        from ng_embed import DualPassIncompleteError
+
+        engine = _make_engine()
+        before = engine._dvs.size
+        engine._embed_fn = lambda _text: (_ for _ in ()).throw(
+            DualPassIncompleteError("pass-2 extraction failed")
+        )
+        result = engine.diagnose("Kernel panic")
+
+        assert engine._dvs.size == before, "dual-pass failure must not write to DVS"
+        assert result.action_taken == "silent_log"
+        assert result.proposed_primitive is None
+
     def test_basic_diagnosis(self):
         engine = _make_engine()
         result = engine.diagnose("Connection refused on port 8080")

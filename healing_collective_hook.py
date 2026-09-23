@@ -9,7 +9,7 @@ The adapter handles all ecosystem wiring (Tier 1/2/3 learning) and
 memory logging.  This file implements what's unique to The Healing
 Collective:
 
-  - _embed():              Sentence-transformer / hash fallback
+  - _embed():              Canonical ecosystem embedding via ng_embed (fail-closed)
   - _module_on_message():  Scan for failure indicators, route to engine
   - _module_stats():       Healing-specific telemetry
 
@@ -24,6 +24,24 @@ SKILL.md entry:
     hook: healing_collective_hook.py::get_instance
 
 # ---- Changelog ----
+# [2026-09-22] Claude Code (Kimi k2.7-code) — Zone Z11: fail-closed _embed(), remove hash fallback
+#   What: _embed() no longer swallows ng_embed exceptions and falls back to the fabricated
+#         _hash_embed() vector. Exceptions from ng_embed (EmbeddingUnavailableError,
+#         DualPassIncompleteError) now propagate to callers. DiagnosisEngine returns a
+#         degraded silent_log result when embedding is unavailable; _bucket_commons_experience()
+#         signals the error to the Commons and skips the turn without writing calibration outcomes.
+#         THC/requirements.txt now lists the canonical lazy deps.
+#   Why:  Spec R1 / Law 7 — hash fallback poisons the substrate with fake 768-dim vectors.
+#         THC's diagnostic role permits degraded-mode operation (skip a pass, log) but never
+#         fabrication. Fix at the caller per LAW 4; ng_embed.py is vendored and untouched.
+#   How:  Removed try/except swallow in _embed(); imported ng_embed exceptions at module top.
+#         DiagnosisEngine catches them and returns a degraded result on embed failure.
+#         _bucket_commons_experience() splits per-turn exceptions: embedding failures call
+#         signal_error() and continue; everything else stays debug-log fail-soft.
+#         _check_failure_from_river() skips _calibrator.record_outcome() when
+#         diagnostic_chain["embedding_unavailable"] is set. Updated test_hook.py to mock
+#         ng_embed.embed and cover every fail-closed path.
+# -------------------
 # [2026-07-05] Claude Code (Sonnet 5) — #330: wire signal_error() into 2 swallowed-exception sites
 #   What: THC pulse-cycle failures (_pulse_loop) and checkpoint failures (_do_checkpoint) now call
 #         self._engine._eco.signal_error(exc, context) alongside the existing log call — deposits raw
@@ -182,6 +200,15 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from openclaw_adapter import OpenClawAdapter
+
+try:
+    from ng_embed import EmbeddingUnavailableError, DualPassIncompleteError
+except Exception:  # noqa: BLE001 — vendored ng_embed may not be importable in all envs
+    class EmbeddingUnavailableError(Exception):  # type: ignore[no-redef]
+        """Placeholder when ng_embed is not on path."""
+
+    class DualPassIncompleteError(Exception):  # type: ignore[no-redef]
+        """Placeholder when ng_embed is not on path."""
 
 try:
     from ng_commons_eco import CommonsEco   # vendored Commons-backed eco adapter (#335)
@@ -346,16 +373,17 @@ class HealingCollectiveHook(OpenClawAdapter):
     # -----------------------------------------------------------------
 
     def _embed(self, text: str) -> np.ndarray:
-        """Embed text via ng_embed (centralized ecosystem embedding).
+        """Embed text via the canonical ng_embed service (fail-closed).
 
-        Ecosystem standard: Snowflake/snowflake-arctic-embed-m-v1.5 (768-dim).
-        ONNX Runtime, no torch dependency.
+        Ecosystem standard: Snowflake/snowflake-arctic-embed-m-v1.5 (768-dim,
+        ONNX Runtime, no torch dependency).
+
+        Fail-closed: if ng_embed cannot produce a real embedding, its exception
+        propagates. Callers decide whether to skip that diagnosis pass or surface
+        the failure. THC never fabricates a hash fallback vector (Law 7 / spec R1).
         """
-        try:
-            from ng_embed import embed
-            return embed(text)
-        except Exception:
-            return self._hash_embed(text)
+        from ng_embed import embed
+        return embed(text)
 
     def _module_on_message(self, text: str, embedding: np.ndarray) -> Dict[str, Any]:
         """No-op — failure detection runs from River events in pulse cycle.
@@ -489,6 +517,17 @@ class HealingCollectiveHook(OpenClawAdapter):
                 if emb is None:
                     continue
                 self._check_failure_from_river({"text": text, "embedding": emb})
+            except (EmbeddingUnavailableError, DualPassIncompleteError) as exc:
+                # Fail-closed: real embedding failure → signal upstream so the
+                # outage is observable, then skip this turn. Zero substrate writes.
+                logger.warning("THC Commons experience embed unavailable: %s", exc)
+                if self._engine._eco is not None:
+                    self._engine._eco.signal_error(exc, {
+                        "component": "_bucket_commons_experience",
+                        "action": "_embed",
+                        "target_id": target_id,
+                    })
+                continue
             except Exception as exc:  # noqa: BLE001 — one bad turn never breaks the pulse
                 logger.debug("THC failure-check from Commons experience failed: %s", exc)
         if len(self._commons_seen) > 4096:
@@ -633,6 +672,11 @@ class HealingCollectiveHook(OpenClawAdapter):
                 diagnosis.proposed_primitive is not None
                 and diagnosis.confidence >= self._config.confidence_recommend
             )
+            # Embedding outage: do NOT record this as a real calibration outcome.
+            # The trigger was real, but the vector was unavailable, so it carries
+            # no signal about the competence model's threshold performance.
+            if diagnosis.diagnostic_chain.get("embedding_unavailable"):
+                return
             self._calibrator.record_outcome(
                 similarity_score=dvs_similarity,
                 novelty_score=novelty,
